@@ -1,5 +1,15 @@
 package com.hellotalk.hook;
 
+import android.app.Activity;
+import android.os.Handler;
+import android.os.Looper;
+import android.view.View;
+import android.view.ViewGroup;
+import android.content.Context;
+
+import java.lang.ref.WeakReference;
+import java.util.concurrent.atomic.AtomicBoolean;
+
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.XC_MethodHook;
 import de.robv.android.xposed.XC_MethodReplacement;
@@ -7,26 +17,26 @@ import de.robv.android.xposed.XposedBridge;
 import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage.LoadPackageParam;
 
-import java.lang.reflect.Method;
-import java.lang.reflect.Proxy;
-import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
-import java.util.List;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.TimeUnit;
-
 public class MainHook implements IXposedHookLoadPackage {
 
-    private static ClassLoader sCl;
-    private static volatile boolean resolving = false;
+    private static ClassLoader cl;
 
-    /*
-     * vq.a.d() 本身没有 URL 参数。
-     * vq.a.intercept() 和 d() 通常在同一线程执行，
-     * 用 ThreadLocal 把当前 URL 关联起来。
-     */
-    private static final ThreadLocal<String> CURRENT_URL =
-            new ThreadLocal<>();
+    private static final Handler MAIN =
+            new Handler(Looper.getMainLooper());
+
+    private static final Object LOCK = new Object();
+
+    private static WeakReference<Object> lastNameSearchView =
+            new WeakReference<>(null);
+
+    private static WeakReference<Activity> pendingActivity =
+            new WeakReference<>(null);
+
+    private static volatile String pendingUsername;
+    private static volatile long pendingSince;
+    private static final AtomicBoolean pending = new AtomicBoolean(false);
+
+    private static final long PENDING_TIMEOUT_MS = 15000L;
 
     @Override
     public void handleLoadPackage(final LoadPackageParam lpparam) {
@@ -34,31 +44,32 @@ public class MainHook implements IXposedHookLoadPackage {
             return;
         }
 
-        sCl = lpparam.classLoader;
+        cl = lpparam.classLoader;
 
         hookVip();
         hookTranslate();
 
-        // 真正的加密/解密诊断
-        hookSecretData();
-        hookVqInterceptor();
-        hookVqDecrypt();
+        // 当前高级搜索页面中的顶部用户名搜索控件
+        hookNameSearchView();
 
-        // 只观察对象，不拦截跳转、不写回 userid
-        hookItem();
+        // 高级搜索列表点击入口
+        hookFilterProfileClick();
 
-        log("=== HT diagnostic module loaded ===");
+        // 捕获原生用户名搜索返回的真实对象
+        hookUserIdGetter();
+
+        log("=== HT final bridge module loaded ===");
     }
 
-    // ------------------------------------------------------------------------
+    // ---------------------------------------------------------------------
     // 假 VIP
-    // ------------------------------------------------------------------------
+    // ---------------------------------------------------------------------
 
     private void hookVip() {
         try {
             XposedHelpers.findAndHookMethod(
                     "xt.h",
-                    sCl,
+                    cl,
                     "j",
                     XC_MethodReplacement.returnConstant(100)
             );
@@ -68,15 +79,15 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    // ------------------------------------------------------------------------
+    // ---------------------------------------------------------------------
     // 无限翻译
-    // ------------------------------------------------------------------------
+    // ---------------------------------------------------------------------
 
     private void hookTranslate() {
         try {
             XposedHelpers.findAndHookMethod(
                     "lx.o",
-                    sCl,
+                    cl,
                     "h",
                     XC_MethodReplacement.returnConstant(true)
             );
@@ -86,535 +97,501 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    // ------------------------------------------------------------------------
-    // SecretDataModel：只打印长度和哈希，不打印密钥原文
-    // ------------------------------------------------------------------------
+    // ---------------------------------------------------------------------
+    // 记录高级搜索页的 UserNameSearchView
+    //
+    // L(int) 会创建并挂载 SearchIDViewV2。
+    // ---------------------------------------------------------------------
 
-    private void hookSecretData() {
+    private void hookNameSearchView() {
         try {
-            Class<?> companion = XposedHelpers.findClass(
-                    "com.hellotalk.ht.base.configure.entity.SecretDataModel$Companion",
-                    sCl
-            );
-
-            hookSecretMethod(companion, "readPub");
-            hookSecretMethod(companion, "readPublicKey");
-            hookSecretMethod(companion, "readSharedSecret");
-
-            log("SecretData hook OK");
-        } catch (Throwable t) {
-            log("SecretData hook FAIL: " + t);
-        }
-    }
-
-    private void hookSecretMethod(Class<?> cls, final String methodName) {
-        XposedHelpers.findAndHookMethod(
-                cls,
-                methodName,
-                new XC_MethodHook() {
-                    @Override
-                    protected void afterHookedMethod(MethodHookParam param) {
-                        try {
-                            Object result = param.getResult();
-                            String value = result == null
-                                    ? ""
-                                    : String.valueOf(result);
-
-                            log("[Secret] " + methodName
-                                    + " len=" + value.length()
-                                    + " sha256=" + sha256(value));
-                        } catch (Throwable t) {
-                            log("[Secret] " + methodName
-                                    + " log failed: " + t);
-                        }
-                    }
-                }
-        );
-    }
-
-    // ------------------------------------------------------------------------
-    // vq.a：真实 network interceptor
-    // ------------------------------------------------------------------------
-
-    private void hookVqInterceptor() {
-        try {
-            Class<?> vqa = XposedHelpers.findClass("vq.a", sCl);
-            Class<?> chain = XposedHelpers.findClass(
-                    "okhttp3.Interceptor$Chain",
-                    sCl
+            Class<?> viewClass = XposedHelpers.findClass(
+                    "com.hellotalk.search.v2.widget.UserNameSearchView",
+                    cl
             );
 
             XposedHelpers.findAndHookMethod(
-                    vqa,
-                    "intercept",
-                    chain,
+                    viewClass,
+                    "L",
+                    int.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            try {
+                                Object view = param.thisObject;
+                                lastNameSearchView =
+                                        new WeakReference<>(view);
+
+                                log("记录 UserNameSearchView: "
+                                        + view.getClass().getName());
+                            } catch (Throwable t) {
+                                log("记录 UserNameSearchView 失败: " + t);
+                            }
+                        }
+                    }
+            );
+
+            log("UserNameSearchView.L hook OK");
+        } catch (Throwable t) {
+            log("UserNameSearchView.L hook FAIL: " + t);
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // 拦截高级搜索列表点击
+    //
+    // 只 hook SearchUserViewModel，不碰：
+    // - SearchListViewModel
+    // - recommend 首页
+    // - 已经有真实 userid 的用户
+    // ---------------------------------------------------------------------
+
+    private void hookFilterProfileClick() {
+        try {
+            Class<?> vmClass = XposedHelpers.findClass(
+                    "com.hellotalk.search.v2.viewmodel.SearchUserViewModel",
+                    cl
+            );
+
+            Class<?> activityClass =
+                    XposedHelpers.findClass(
+                            "android.app.Activity",
+                            cl
+                    );
+
+            Class<?> itemClass =
+                    XposedHelpers.findClass(
+                            "rl0.e",
+                            cl
+                    );
+
+            XposedHelpers.findAndHookMethod(
+                    vmClass,
+                    "goToProfile",
+                    activityClass,
+                    itemClass,
                     new XC_MethodHook() {
                         @Override
                         protected void beforeHookedMethod(MethodHookParam param) {
                             try {
-                                Object chainObj = param.args[0];
-                                Object request = XposedHelpers.callMethod(
-                                        chainObj,
-                                        "request"
-                                );
+                                Activity activity =
+                                        (Activity) param.args[0];
 
-                                Object url = XposedHelpers.callMethod(
-                                        request,
-                                        "url"
-                                );
+                                Object item = param.args[1];
 
-                                String urlString = String.valueOf(url);
+                                int uid = readUid(item);
+                                String username = readUsername(item);
 
-                                if (!urlString.contains(
-                                        "/go_user_search/v2/universal"
-                                )) {
+                                log("高级搜索点击: uid=" + uid
+                                        + ", username=" + username);
+
+                                // 正常用户完全放行
+                                if (uid != 0) {
                                     return;
                                 }
 
-                                CURRENT_URL.set(urlString);
-
-                                Object contentType =
-                                        XposedHelpers.callMethod(
-                                                request,
-                                                "header",
-                                                "ht-content-type"
-                                        );
-
-                                Object pub =
-                                        XposedHelpers.callMethod(
-                                                request,
-                                                "header",
-                                                "x-ht-pub"
-                                        );
-
-                                Object body =
-                                        XposedHelpers.callMethod(
-                                                request,
-                                                "body"
-                                        );
-
-                                log("[vq.a request]"
-                                        + "\nurl=" + urlString
-                                        + "\nht-content-type=" + contentType
-                                        + "\nx-ht-pub="
-                                        + summarizeString(pub)
-                                        + "\nbody="
-                                        + summarizeRequestBody(body));
-
-                            } catch (Throwable t) {
-                                log("[vq.a request] error: " + t);
-                            }
-                        }
-
-                        @Override
-                        protected void afterHookedMethod(MethodHookParam param) {
-                            try {
-                                if (CURRENT_URL.get() != null) {
-                                    log("[vq.a response] url="
-                                            + CURRENT_URL.get());
+                                // 没有 username 无法走原生反查，放行原逻辑
+                                if (isBlank(username)) {
+                                    log("userid=0 且 username 为空，放行原逻辑");
+                                    return;
                                 }
+
+                                // 避免同时处理多个点击
+                                synchronized (LOCK) {
+                                    if (pending.get()) {
+                                        log("已有 pending 请求，放行本次点击");
+                                        return;
+                                    }
+
+                                    pendingActivity =
+                                            new WeakReference<>(activity);
+                                    pendingUsername = username;
+                                    pendingSince =
+                                            System.currentTimeMillis();
+                                    pending.set(true);
+                                }
+
+                                log("拦截 userid=0，转入原生用户名搜索: "
+                                        + username);
+
+                                // 原方法会把 userid=0 交给 sl0.c，
+                                // 必然打开错误页面，所以阻止它。
+                                param.setResult(null);
+
+                                final Object view =
+                                        getUsableNameSearchView(activity);
+
+                                if (view == null) {
+                                    log("找不到当前 UserNameSearchView");
+                                    clearPending();
+                                    return;
+                                }
+
+                                // 等待 FragmentTransaction 完成后再调用 M()
+                                MAIN.postDelayed(new Runnable() {
+                                    @Override
+                                    public void run() {
+                                        try {
+                                            if (!pending.get()) {
+                                                return;
+                                            }
+
+                                            Activity a =
+                                                    pendingActivity.get();
+
+                                            if (a == null
+                                                    || a.isFinishing()
+                                                    || isDestroyed(a)) {
+                                                log("Activity 已失效");
+                                                clearPending();
+                                                return;
+                                            }
+
+                                            String name =
+                                                    pendingUsername;
+
+                                            log("调用原生 UserNameSearchView.M("
+                                                    + name + ")");
+
+                                            XposedHelpers.callMethod(
+                                                    view,
+                                                    "M",
+                                                    name
+                                            );
+
+                                            scheduleTimeout();
+                                        } catch (Throwable t) {
+                                            log("调用原生 M() 失败: " + t);
+                                            clearPending();
+                                        }
+                                    }
+                                }, 150L);
+
                             } catch (Throwable t) {
-                                log("[vq.a response] error: " + t);
-                            } finally {
-                                CURRENT_URL.remove();
+                                log("goToProfile hook 异常: " + t);
                             }
                         }
                     }
             );
 
-            log("vq.a intercept hook OK");
+            log("SearchUserViewModel.goToProfile hook OK");
         } catch (Throwable t) {
-            log("vq.a intercept hook FAIL: " + t);
+            log("SearchUserViewModel.goToProfile hook FAIL: " + t);
         }
     }
 
-    // ------------------------------------------------------------------------
-    // vq.a.d：真实响应解密函数
-    // d([B, String contentType, String encoding) -> [B
-    // ------------------------------------------------------------------------
+    // ---------------------------------------------------------------------
+    // 捕获原生用户名搜索返回的真实 rl0.e
+    //
+    // 注意：这里不自动反查。
+    // 只有 pendingUsername 存在时才匹配。
+    // ---------------------------------------------------------------------
 
-    private void hookVqDecrypt() {
+    private void hookUserIdGetter() {
         try {
-            Class<?> vqa = XposedHelpers.findClass("vq.a", sCl);
-
-            XposedHelpers.findAndHookMethod(
-                    vqa,
-                    "d",
-                    byte[].class,
-                    String.class,
-                    String.class,
-                    new XC_MethodHook() {
-                        @Override
-                        protected void beforeHookedMethod(MethodHookParam param) {
-                            try {
-                                byte[] raw = (byte[]) param.args[0];
-                                String contentType =
-                                        String.valueOf(param.args[1]);
-                                String encoding =
-                                        String.valueOf(param.args[2]);
-
-                                if (!isUniversalThread()) {
-                                    return;
-                                }
-
-                                log("[vq.a decrypt input]"
-                                        + "\nurl=" + CURRENT_URL.get()
-                                        + "\ncontentType=" + contentType
-                                        + "\nencoding=" + encoding
-                                        + "\nrawLen="
-                                        + (raw == null ? -1 : raw.length)
-                                        + "\nrawSha256="
-                                        + sha256(raw));
-                            } catch (Throwable t) {
-                                log("[vq.a decrypt input] error: " + t);
-                            }
-                        }
-
-                        @Override
-                        protected void afterHookedMethod(MethodHookParam param) {
-                            try {
-                                if (!isUniversalThread()) {
-                                    return;
-                                }
-
-                                byte[] plain = (byte[]) param.getResult();
-
-                                log("[vq.a decrypt output]"
-                                        + "\nurl=" + CURRENT_URL.get()
-                                        + "\nplainLen="
-                                        + (plain == null ? -1 : plain.length)
-                                        + "\nplainSha256="
-                                        + sha256(plain)
-                                        + "\nplainPreview="
-                                        + previewBytes(plain, 5000));
-
-                            } catch (Throwable t) {
-                                log("[vq.a decrypt output] error: " + t);
-                            }
-                        }
-                    }
-            );
-
-            log("vq.a decrypt hook OK");
-        } catch (Throwable t) {
-            log("vq.a decrypt hook FAIL: " + t);
-        }
-    }
-
-    private static boolean isUniversalThread() {
-        String url = CURRENT_URL.get();
-        return url != null
-                && url.contains("/go_user_search/v2/universal");
-    }
-
-    // ------------------------------------------------------------------------
-    // rl0.e：只打印 userid，不反查、不拦截、不写回
-    // ------------------------------------------------------------------------
-
-    private void hookItem() {
-        try {
-            XposedHelpers.findAndHookMethod(
+            Class<?> itemClass = XposedHelpers.findClass(
                     "rl0.e",
-                    sCl,
+                    cl
+            );
+
+            XposedHelpers.findAndHookMethod(
+                    itemClass,
                     "T",
                     new XC_MethodHook() {
                         @Override
                         protected void afterHookedMethod(MethodHookParam param) {
                             try {
+                                if (!pending.get()) {
+                                    return;
+                                }
+
                                 Object item = param.thisObject;
-                                Object uidObject = param.getResult();
+                                int uid = readUidFromResult(param);
+                                String username = readUsername(item);
 
-                                int uid = uidObject == null
-                                        ? 0
-                                        : ((Integer) uidObject);
+                                if (uid <= 0 || isBlank(username)) {
+                                    return;
+                                }
 
-                                Object username =
-                                        XposedHelpers.getObjectField(item, "Y");
+                                String wanted = pendingUsername;
 
-                                log("[item]"
-                                        + " userid=" + uid
-                                        + " username=" + username);
+                                if (wanted == null
+                                        || !wanted.equals(username)) {
+                                    return;
+                                }
+
+                                Activity activity =
+                                        pendingActivity.get();
+
+                                if (activity == null
+                                        || activity.isFinishing()
+                                        || isDestroyed(activity)) {
+                                    log("真实结果匹配，但 Activity 已失效");
+                                    clearPending();
+                                    return;
+                                }
+
+                                // 防止同一个对象被 Paging/Adapter 多次读取
+                                if (!pending.compareAndSet(true, false)) {
+                                    return;
+                                }
+
+                                pendingUsername = null;
+                                pendingActivity =
+                                        new WeakReference<>(null);
+
+                                log("匹配到真实用户: username="
+                                        + username
+                                        + ", userid=" + uid);
+
+                                final Activity finalActivity = activity;
+                                final Object finalItem = item;
+
+                                MAIN.post(new Runnable() {
+                                    @Override
+                                    public void run() {
+                                        try {
+                                            invokeNativeProfileEntry(
+                                                    finalActivity,
+                                                    finalItem
+                                            );
+                                        } catch (Throwable t) {
+                                            log("原生主页跳转失败: " + t);
+                                        }
+                                    }
+                                });
+
                             } catch (Throwable t) {
-                                log("[item] error: " + t);
+                                log("T() 捕获真实对象异常: " + t);
                             }
                         }
                     }
             );
 
-            log("Item hook OK");
+            log("rl0.e.T hook OK");
         } catch (Throwable t) {
-            log("Item hook FAIL: " + t);
+            log("rl0.e.T hook FAIL: " + t);
         }
     }
 
-    // ------------------------------------------------------------------------
-    // 保留旧的反查诊断，但默认不自动触发
-    // 这版先不自动反查，避免测试时制造额外变量。
-    // ------------------------------------------------------------------------
+    // ---------------------------------------------------------------------
+    // 调用 App 原生最终主页出口 sl0.c.e()
+    //
+    // UserNameSearchFragment 原生使用：
+    // source     = "user_filter_word"
+    // filterType = "SearchService"
+    // position   = 0
+    // ---------------------------------------------------------------------
 
-    static int resolveUidByUsername(String username) {
-        if (username == null || username.isEmpty()) {
-            return 0;
-        }
-
-        String nickname = username.startsWith("@")
-                ? username.substring(1)
-                : username;
-
-        log("[manual resolve] nickname=" + nickname);
-
+    private static void invokeNativeProfileEntry(
+            Activity activity,
+            Object item
+    ) {
         try {
-            Class<?> apiClass = XposedHelpers.findClass(
-                    "ql0.c",
-                    sCl
+            Class<?> sl0c = XposedHelpers.findClass(
+                    "sl0.c",
+                    cl
             );
 
-            Class<?> factory = XposedHelpers.findClass(
-                    "m41.f0",
-                    sCl
+            Object singleton =
+                    XposedHelpers.getStaticObjectField(sl0c, "a");
+
+            XposedHelpers.callMethod(
+                    singleton,
+                    "e",
+                    activity,
+                    item,
+                    "user_filter_word",
+                    "SearchService",
+                    0
             );
 
-            Class<?> serviceFactory = XposedHelpers.findClass(
-                    "qh0.a",
-                    sCl
-            );
-
-            Object wrapper = XposedHelpers.callStaticMethod(
-                    factory,
-                    "b",
-                    apiClass
-            );
-
-            Object api = XposedHelpers.callStaticMethod(
-                    serviceFactory,
-                    "a",
-                    wrapper
-            );
-
-            Class<?> continuationClass = XposedHelpers.findClass(
-                    "d41.d",
-                    sCl
-            );
-
-            Method universal = null;
-
-            for (Method method : apiClass.getDeclaredMethods()) {
-                if ("g".equals(method.getName())
-                        && method.getParameterTypes().length == 4
-                        && method.getParameterTypes()[0] == int.class) {
-                    universal = method;
-                    break;
-                }
-            }
-
-            if (universal == null) {
-                log("[manual resolve] g not found");
-                return 0;
-            }
-
-            universal.setAccessible(true);
-
-            final CountDownLatch latch = new CountDownLatch(1);
-            final Object[] holder = new Object[1];
-
-            Object context = getEmptyCoroutineContext();
-
-            Object continuation = Proxy.newProxyInstance(
-                    sCl,
-                    new Class[]{continuationClass},
-                    (proxy, method, args) -> {
-                        if ("resumeWith".equals(method.getName())) {
-                            holder[0] = args == null
-                                    ? null
-                                    : args[0];
-                            latch.countDown();
-                            return null;
-                        }
-
-                        if ("getContext".equals(method.getName())) {
-                            return context;
-                        }
-
-                        return null;
-                    }
-            );
-
-            universal.invoke(
-                    api,
-                    1,
-                    15,
-                    nickname,
-                    continuation
-            );
-
-            if (!latch.await(15, TimeUnit.SECONDS)) {
-                log("[manual resolve] timeout");
-                return 0;
-            }
-
-            Object result = holder[0];
-
-            if (result == null) {
-                log("[manual resolve] null result");
-                return 0;
-            }
-
-            Object lcResponse =
-                    XposedHelpers.getObjectField(result, "b");
-
-            Object code =
-                    XposedHelpers.callMethod(lcResponse, "getCode");
-
-            Object data =
-                    XposedHelpers.callMethod(lcResponse, "getData");
-
-            log("[manual resolve] code=" + code
-                    + " data=" + data);
-
-            if (data == null) {
-                return 0;
-            }
-
-            List<?> list = (List<?>) XposedHelpers.callMethod(
-                    data,
-                    "b"
-            );
-
-            if (list == null) {
-                return 0;
-            }
-
-            for (Object item : list) {
-                Object uid =
-                        XposedHelpers.getObjectField(item, "T");
-
-                Object name =
-                        XposedHelpers.getObjectField(item, "Y");
-
-                log("[manual resolve candidate]"
-                        + " userid=" + uid
-                        + " username=" + name);
-
-                if (uid instanceof Integer
-                        && ((Integer) uid) != 0) {
-                    return (Integer) uid;
-                }
-            }
-
+            log("已调用 sl0.c.e()，userid="
+                    + readUid(item));
         } catch (Throwable t) {
-            log("[manual resolve] failed: " + t);
+            log("调用 sl0.c.e() 失败: " + t);
         }
-
-        return 0;
     }
 
-    private static Object getEmptyCoroutineContext() {
-        try {
-            Class<?> contextClass =
-                    XposedHelpers.findClass("d41.g", sCl);
+    // ---------------------------------------------------------------------
+    // 获取当前可用的 UserNameSearchView
+    // ---------------------------------------------------------------------
 
-            return XposedHelpers.getStaticObjectField(
-                    contextClass,
-                    "n"
+    private static Object getUsableNameSearchView(Activity activity) {
+        Object view = lastNameSearchView.get();
+
+        if (view != null && belongsToActivity(view, activity)) {
+            return view;
+        }
+
+        // 兜底：从 Activity 的 View 树递归查找
+        try {
+            View root = activity.getWindow().getDecorView();
+
+            Object found = findViewByClass(
+                    root,
+                    "com.hellotalk.search.v2.widget.UserNameSearchView"
             );
+
+            if (found != null) {
+                lastNameSearchView =
+                        new WeakReference<>(found);
+            }
+
+            return found;
         } catch (Throwable t) {
-            log("EmptyCoroutineContext error: " + t);
+            log("查找 UserNameSearchView 失败: " + t);
             return null;
         }
     }
 
-    // ------------------------------------------------------------------------
-    // 工具函数
-    // ------------------------------------------------------------------------
-
-    private static String summarizeString(Object value) {
-        if (value == null) {
-            return "null";
-        }
-
-        String text = String.valueOf(value);
-
-        return "len=" + text.length()
-                + ", sha256=" + sha256(text)
-                + ", prefix="
-                + (text.length() <= 24
-                ? text
-                : text.substring(0, 24) + "...");
-    }
-
-    private static String summarizeRequestBody(Object body) {
-        if (body == null) {
-            return "null";
-        }
-
+    private static boolean belongsToActivity(
+            Object view,
+            Activity activity
+    ) {
         try {
-            Object contentType =
-                    XposedHelpers.callMethod(body, "contentType");
+            Object context =
+                    XposedHelpers.callMethod(view, "getContext");
 
-            Object length =
-                    XposedHelpers.callMethod(body, "contentLength");
-
-            return "contentType=" + contentType
-                    + ", length=" + length;
-        } catch (Throwable t) {
-            return "body=" + body.getClass().getName();
-        }
-    }
-
-    private static String previewBytes(byte[] bytes, int maxChars) {
-        if (bytes == null) {
-            return "null";
-        }
-
-        try {
-            String text = new String(
-                    bytes,
-                    StandardCharsets.UTF_8
-            );
-
-            if (text.length() > maxChars) {
-                return text.substring(0, maxChars) + "...";
+            if (context == activity) {
+                return true;
             }
 
-            return text;
-        } catch (Throwable t) {
-            return "<not utf8>";
+            if (context instanceof android.content.ContextWrapper) {
+                Context base =
+                        ((android.content.ContextWrapper) context)
+                                .getBaseContext();
+
+                return base == activity;
+            }
+        } catch (Throwable ignored) {
         }
+
+        return false;
     }
 
-    private static String sha256(String value) {
-        if (value == null) {
-            return "null";
+    private static Object findViewByClass(
+            View view,
+            String className
+    ) {
+        if (view == null) {
+            return null;
         }
 
-        try {
-            return sha256(
-                    value.getBytes(StandardCharsets.UTF_8)
-            );
-        } catch (Throwable t) {
-            return "error";
+        if (view.getClass().getName().equals(className)) {
+            return view;
         }
+
+        if (view instanceof ViewGroup) {
+            ViewGroup group = (ViewGroup) view;
+
+            for (int i = 0; i < group.getChildCount(); i++) {
+                Object result =
+                        findViewByClass(group.getChildAt(i), className);
+
+                if (result != null) {
+                    return result;
+                }
+            }
+        }
+
+        return null;
     }
 
-    private static String sha256(byte[] bytes) {
-        if (bytes == null) {
-            return "null";
-        }
+    // ---------------------------------------------------------------------
+    // pending 管理
+    // ---------------------------------------------------------------------
 
+    private static void scheduleTimeout() {
+        final long started = pendingSince;
+
+        MAIN.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                if (!pending.get()) {
+                    return;
+                }
+
+                if (pendingSince != started) {
+                    return;
+                }
+
+                if (System.currentTimeMillis() - started
+                        >= PENDING_TIMEOUT_MS) {
+                    log("原生用户名搜索超时，清理 pending: "
+                            + pendingUsername);
+                    clearPending();
+                }
+            }
+        }, PENDING_TIMEOUT_MS + 300L);
+    }
+
+    private static void clearPending() {
+        pending.set(false);
+        pendingUsername = null;
+        pendingActivity =
+                new WeakReference<>(null);
+        pendingSince = 0L;
+    }
+
+    // ---------------------------------------------------------------------
+    // 字段读取
+    // ---------------------------------------------------------------------
+
+    private static int readUid(Object item) {
         try {
-            MessageDigest digest =
-                    MessageDigest.getInstance("SHA-256");
+            Object result =
+                    XposedHelpers.callMethod(item, "T");
 
-            byte[] result = digest.digest(bytes);
-            StringBuilder builder = new StringBuilder();
-
-            for (byte b : result) {
-                builder.append(String.format("%02x", b));
+            if (result instanceof Integer) {
+                return (Integer) result;
             }
 
-            return builder.toString();
+            return 0;
         } catch (Throwable t) {
-            return "error";
+            return 0;
+        }
+    }
+
+    private static int readUidFromResult(
+            XC_MethodHook.MethodHookParam param
+    ) {
+        try {
+            Object result = param.getResult();
+
+            if (result instanceof Integer) {
+                return (Integer) result;
+            }
+
+            return 0;
+        } catch (Throwable t) {
+            return 0;
+        }
+    }
+
+    private static String readUsername(Object item) {
+        try {
+            Object result =
+                    XposedHelpers.getObjectField(item, "Y");
+
+            return result == null
+                    ? null
+                    : String.valueOf(result);
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    private static boolean isBlank(String value) {
+        return value == null || value.trim().isEmpty();
+    }
+
+    private static boolean isDestroyed(Activity activity) {
+        try {
+            return android.os.Build.VERSION.SDK_INT >= 17
+                    && activity.isDestroyed();
+        } catch (Throwable t) {
+            return false;
         }
     }
 
