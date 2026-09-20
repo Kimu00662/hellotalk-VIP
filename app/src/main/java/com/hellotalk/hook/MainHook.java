@@ -77,7 +77,7 @@ public class MainHook implements IXposedHookLoadPackage {
 
                 Object item = param.args[1];
                 int uid = getUid(item);
-                if (uid != 0) return; // 真实ID，放行
+                if (uid != 0) return;
 
                 String username = (String) XposedHelpers.getObjectField(item, "Y");
                 final Object[] args = param.args;
@@ -202,8 +202,14 @@ public class MainHook implements IXposedHookLoadPackage {
 
         } catch (Throwable t) {
             log("resolveUid FAIL: " + t);
-            for (StackTraceElement e : t.getStackTrace()) {
-                log("  at " + e);
+            Throwable real = t;
+            while (real instanceof java.lang.reflect.InvocationTargetException
+                    && real.getCause() != null) {
+                real = real.getCause();
+            }
+            log("  ★真正原因: " + real);
+            for (StackTraceElement e : real.getStackTrace()) {
+                log("    at " + e);
             }
             return 0;
         }
