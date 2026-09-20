@@ -1,7 +1,6 @@
 package com.hellotalk.hook;
 
 import android.app.Activity;
-import android.content.Context;
 import android.content.ContextWrapper;
 import android.os.Handler;
 import android.os.Looper;
@@ -20,532 +19,399 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage.LoadPackageParam;
 
 public class MainHook implements IXposedHookLoadPackage {
 
-    private static ClassLoader sCl;
+    private static ClassLoader cl;
 
-    private static final Handler MAIN_HANDLER =
+    private static final Handler MAIN =
             new Handler(Looper.getMainLooper());
 
-    private static final Object LOCK = new Object();
-
-    private static final AtomicBoolean PENDING =
+    private static final AtomicBoolean pending =
             new AtomicBoolean(false);
 
     private static WeakReference<Activity> pendingActivity =
             new WeakReference<>(null);
 
-    private static WeakReference<Object> nameSearchView =
+    private static WeakReference<Object> searchView =
             new WeakReference<>(null);
 
     private static volatile String pendingUsername;
-    private static volatile long pendingStartTime;
+    private static volatile long pendingTime;
 
-    private static final long TIMEOUT_MS = 15000L;
+    private static final long TIMEOUT = 15000L;
 
     @Override
-    public void handleLoadPackage(final LoadPackageParam lpparam) {
+    public void handleLoadPackage(LoadPackageParam lpparam) {
         if (!"com.hellotalk".equals(lpparam.packageName)) {
             return;
         }
 
-        sCl = lpparam.classLoader;
+        cl = lpparam.classLoader;
 
-        /*
-         * 每个功能单独保护。
-         * 即使搜索桥接 hook 失败，也不能影响假 VIP 和翻译。
-         */
-        try {
-            hookVip();
-        } catch (Throwable t) {
-            log("hookVip outer fail: " + t);
-        }
+        safe(MainHook::hookVip);
+        safe(MainHook::hookTranslate);
+        safe(MainHook::hookFilterVip);
+        safe(MainHook::hookSearchView);
+        safe(MainHook::hookProfileClick);
+        safe(MainHook::hookResolvedItem);
 
-        try {
-            hookTranslate();
-        } catch (Throwable t) {
-            log("hookTranslate outer fail: " + t);
-        }
-
-        try {
-            hookUserNameSearchView();
-        } catch (Throwable t) {
-            log("hookUserNameSearchView outer fail: " + t);
-        }
-
-        try {
-            hookFilterProfileClick();
-        } catch (Throwable t) {
-            log("hookFilterProfileClick outer fail: " + t);
-        }
-
-        try {
-            hookResolvedUserCapture();
-        } catch (Throwable t) {
-            log("hookResolvedUserCapture outer fail: " + t);
-        }
-
-        log("=== HT stable + profile bridge loaded ===");
+        log("=== HT FULL VERSION LOADED ===");
     }
 
-    // ---------------------------------------------------------------------
-    // 假 VIP
-    // ---------------------------------------------------------------------
+    private interface Task {
+        void run() throws Throwable;
+    }
 
-    private static void hookVip() {
+    private static void safe(Task task) {
         try {
-            Class<?> vipClass =
-                    XposedHelpers.findClass("xt.h", sCl);
-
-            XposedHelpers.findAndHookMethod(
-                    vipClass,
-                    "j",
-                    new XC_MethodReplacement() {
-                        @Override
-                        protected Object replaceHookedMethod(
-                                MethodHookParam param
-                        ) {
-                            return 100;
-                        }
-                    }
-            );
-
-            log("假VIP OK");
+            task.run();
         } catch (Throwable t) {
-            log("假VIP FAIL: " + t);
+            log("hook exception: " + t);
             XposedBridge.log(t);
         }
     }
 
-    // ---------------------------------------------------------------------
+    // ------------------------------------------------------------------
+    // 假 VIP：双保险
+    // ------------------------------------------------------------------
+
+    private static void hookVip() throws Throwable {
+        Class<?> cls = XposedHelpers.findClass("xt.h", cl);
+
+        XposedHelpers.findAndHookMethod(
+                cls,
+                "j",
+                new XC_MethodHook() {
+                    @Override
+                    protected void beforeHookedMethod(MethodHookParam p) {
+                        log("[VIP] xt.h.j called");
+                    }
+
+                    @Override
+                    protected void afterHookedMethod(MethodHookParam p) {
+                        log("[VIP] xt.h.j result -> 100");
+                        p.setResult(100);
+                    }
+                }
+        );
+
+        log("假VIP hook OK");
+    }
+
+    /*
+     * 高级搜索自己的 ViewModel 也强制返回 true。
+     * 如果 xt.h.j() 没有被调用，这一层仍然能让客户端 UI 放行。
+     */
+    private static void hookFilterVip() throws Throwable {
+        Class<?> cls = XposedHelpers.findClass(
+                "com.hellotalk.search.v2.logic.controller.searchuser.SearchFilterViewModelV2",
+                cl
+        );
+
+        XposedHelpers.findAndHookMethod(
+                cls,
+                "isVip",
+                new XC_MethodHook() {
+                    @Override
+                    protected void afterHookedMethod(MethodHookParam p) {
+                        log("[VIP] SearchFilterViewModelV2.isVip -> true");
+                        p.setResult(true);
+                    }
+                }
+        );
+
+        log("SearchFilterViewModelV2.isVip hook OK");
+    }
+
+    // ------------------------------------------------------------------
     // 无限翻译
-    // ---------------------------------------------------------------------
+    // ------------------------------------------------------------------
 
-    private static void hookTranslate() {
-        try {
-            Class<?> translateClass =
-                    XposedHelpers.findClass("lx.o", sCl);
+    private static void hookTranslate() throws Throwable {
+        Class<?> cls = XposedHelpers.findClass("lx.o", cl);
 
-            XposedHelpers.findAndHookMethod(
-                    translateClass,
-                    "h",
-                    new XC_MethodReplacement() {
-                        @Override
-                        protected Object replaceHookedMethod(
-                                MethodHookParam param
-                        ) {
-                            return true;
-                        }
-                    }
-            );
+        XposedHelpers.findAndHookMethod(
+                cls,
+                "h",
+                XC_MethodReplacement.returnConstant(true)
+        );
 
-            log("翻译 OK");
-        } catch (Throwable t) {
-            log("翻译 FAIL: " + t);
-            XposedBridge.log(t);
-        }
+        log("翻译 hook OK");
     }
 
-    // ---------------------------------------------------------------------
+    // ------------------------------------------------------------------
     // 记录 UserNameSearchView
-    //
-    // SearchFilterActivityV2$e.a() 会调用 UserNameSearchView.L(int)
-    // 创建当前高级搜索页自己的 SearchIDViewV2。
-    // ---------------------------------------------------------------------
+    // ------------------------------------------------------------------
 
-    private static void hookUserNameSearchView() {
-        try {
-            Class<?> viewClass =
-                    XposedHelpers.findClass(
-                            "com.hellotalk.search.v2.widget.UserNameSearchView",
-                            sCl
-                    );
+    private static void hookSearchView() throws Throwable {
+        Class<?> cls = XposedHelpers.findClass(
+                "com.hellotalk.search.v2.widget.UserNameSearchView",
+                cl
+        );
 
-            XposedHelpers.findAndHookMethod(
-                    viewClass,
-                    "L",
-                    int.class,
-                    new XC_MethodHook() {
-                        @Override
-                        protected void afterHookedMethod(
-                                MethodHookParam param
-                        ) {
-                            try {
-                                nameSearchView =
-                                        new WeakReference<>(param.thisObject);
-
-                                log("UserNameSearchView.L OK，已记录控件");
-                            } catch (Throwable t) {
-                                log("记录 UserNameSearchView 失败: " + t);
-                            }
-                        }
+        XposedHelpers.findAndHookMethod(
+                cls,
+                "L",
+                int.class,
+                new XC_MethodHook() {
+                    @Override
+                    protected void afterHookedMethod(MethodHookParam p) {
+                        searchView =
+                                new WeakReference<>(p.thisObject);
+                        log("[BRIDGE] UserNameSearchView.L captured");
                     }
-            );
+                }
+        );
 
-            log("UserNameSearchView.L hook OK");
-        } catch (Throwable t) {
-            log("UserNameSearchView.L hook FAIL: " + t);
-            XposedBridge.log(t);
-        }
+        log("UserNameSearchView.L hook OK");
     }
 
-    // ---------------------------------------------------------------------
-    // 高级搜索点击入口
-    //
-    // 只 hook SearchUserViewModel：
-    // - 高级自定义搜索使用它；
-    // - 首页 recommend 使用 SearchListViewModel，不会被影响。
-    // ---------------------------------------------------------------------
+    // ------------------------------------------------------------------
+    // 拦截高级搜索 userid=0 的点击
+    // ------------------------------------------------------------------
 
-    private static void hookFilterProfileClick() {
-        try {
-            Class<?> vmClass =
-                    XposedHelpers.findClass(
-                            "com.hellotalk.search.v2.viewmodel.SearchUserViewModel",
-                            sCl
-                    );
+    private static void hookProfileClick() throws Throwable {
+        Class<?> vm = XposedHelpers.findClass(
+                "com.hellotalk.search.v2.viewmodel.SearchUserViewModel",
+                cl
+        );
 
-            Class<?> activityClass =
-                    XposedHelpers.findClass(
-                            "android.app.Activity",
-                            sCl
-                    );
+        Class<?> activity = XposedHelpers.findClass(
+                "android.app.Activity",
+                cl
+        );
 
-            Class<?> itemClass =
-                    XposedHelpers.findClass("rl0.e", sCl);
+        Class<?> item = XposedHelpers.findClass("rl0.e", cl);
 
-            XposedHelpers.findAndHookMethod(
-                    vmClass,
-                    "goToProfile",
-                    activityClass,
-                    itemClass,
-                    new XC_MethodHook() {
-                        @Override
-                        protected void beforeHookedMethod(
-                                MethodHookParam param
-                        ) {
-                            try {
-                                Activity activity =
-                                        (Activity) param.args[0];
+        XposedHelpers.findAndHookMethod(
+                vm,
+                "goToProfile",
+                activity,
+                item,
+                new XC_MethodHook() {
+                    @Override
+                    protected void beforeHookedMethod(MethodHookParam p) {
+                        try {
+                            Activity a = (Activity) p.args[0];
+                            Object user = p.args[1];
 
-                                Object item = param.args[1];
+                            int uid = readUid(user);
+                            String name = readName(user);
 
-                                int uid = readUid(item);
-                                String username = readUsername(item);
+                            log("[BRIDGE] click uid="
+                                    + uid + " name=" + name);
 
-                                /*
-                                 * 真实 ID 完全放行。
-                                 * 国籍、年龄、新用户等正常结果不受影响。
-                                 */
-                                if (uid != 0) {
-                                    return;
-                                }
+                            // 真实 ID 直接放行
+                            if (uid != 0) {
+                                return;
+                            }
 
-                                if (isBlank(username)) {
-                                    log("userid=0 且 username 为空，放行");
-                                    return;
-                                }
+                            // 无 username 无法反查，放行原逻辑
+                            if (blank(name)) {
+                                return;
+                            }
 
-                                synchronized (LOCK) {
-                                    if (PENDING.get()) {
-                                        log("已有 pending，放行本次点击");
+                            // 防止多个异步请求同时运行
+                            if (!pending.compareAndSet(false, true)) {
+                                log("[BRIDGE] another request pending");
+                                return;
+                            }
+
+                            pendingActivity =
+                                    new WeakReference<>(a);
+                            pendingUsername = name;
+                            pendingTime =
+                                    System.currentTimeMillis();
+
+                            // 阻止原方法使用 user_id=0
+                            p.setResult(null);
+
+                            Object view =
+                                    findSearchView(a);
+
+                            if (view == null) {
+                                log("[BRIDGE] UserNameSearchView not found");
+                                clearPending();
+                                return;
+                            }
+
+                            final Object finalView = view;
+                            final String finalName = name;
+
+                            MAIN.postDelayed(() -> {
+                                try {
+                                    if (!pending.get()) {
                                         return;
                                     }
 
-                                    PENDING.set(true);
-                                    pendingActivity =
-                                            new WeakReference<>(activity);
-                                    pendingUsername = username;
-                                    pendingStartTime =
-                                            System.currentTimeMillis();
-                                }
+                                    /*
+                                     * UserNameSearchView.M() 会调用当前
+                                     * SearchIDViewV2 的 requestUser()。
+                                     */
+                                    log("[BRIDGE] call native M: "
+                                            + finalName);
 
-                                log("拦截 userid=0: " + username);
+                                    XposedHelpers.callMethod(
+                                            finalView,
+                                            "M",
+                                            finalName
+                                    );
 
-                                /*
-                                 * 原方法继续执行会使用 user_id=0，
-                                 * 因此必须阻止原方法。
-                                 */
-                                param.setResult(null);
-
-                                Object view =
-                                        findCurrentNameSearchView(activity);
-
-                                if (view == null) {
-                                    log("找不到 UserNameSearchView");
+                                    setTimeout();
+                                } catch (Throwable t) {
+                                    log("[BRIDGE] call M failed: " + t);
                                     clearPending();
-                                    return;
                                 }
+                            }, 300L);
 
-                                final Object finalView = view;
-                                final String finalUsername = username;
+                        } catch (Throwable t) {
+                            log("[BRIDGE] click error: " + t);
+                            clearPending();
+                        }
+                    }
+                }
+        );
 
-                                /*
-                                 * M() 内部会查找 SearchIDViewV2。
-                                 * 如果当前 Fragment 尚未挂载，先调用 L()，
-                                 * 再延迟调用 M()。
-                                 */
-                                MAIN_HANDLER.post(new Runnable() {
-                                    @Override
-                                    public void run() {
-                                        try {
-                                            if (!PENDING.get()) {
-                                                return;
-                                            }
+        log("SearchUserViewModel.goToProfile hook OK");
+    }
 
-                                            Object fragment =
-                                                    XposedHelpers.callMethod(
-                                                            finalView,
-                                                            "G"
-                                                    );
+    // ------------------------------------------------------------------
+    // 捕获原生用户名搜索返回的真实 rl0.e
+    // ------------------------------------------------------------------
 
-                                            if (fragment == null) {
-                                                /*
-                                                 * 0x7f0a181e 是已确认的
-                                                 * search_user_name_container。
-                                                 */
-                                                XposedHelpers.callMethod(
-                                                        finalView,
-                                                        "L",
-                                                        0x7f0a181e
-                                                );
-                                            }
+    private static void hookResolvedItem() throws Throwable {
+        Class<?> cls = XposedHelpers.findClass("rl0.e", cl);
 
-                                            MAIN_HANDLER.postDelayed(
-                                                    new Runnable() {
-                                                        @Override
-                                                        public void run() {
-                                                            try {
-                                                                if (!PENDING.get()) {
-                                                                    return;
-                                                                }
+        XposedHelpers.findAndHookMethod(
+                cls,
+                "T",
+                new XC_MethodHook() {
+                    @Override
+                    protected void afterHookedMethod(MethodHookParam p) {
+                        try {
+                            if (!pending.get()) {
+                                return;
+                            }
 
-                                                                log("调用原生 M(): "
-                                                                        + finalUsername);
+                            Object user = p.thisObject;
+                            Object result = p.getResult();
 
-                                                                XposedHelpers
-                                                                        .callMethod(
-                                                                                finalView,
-                                                                                "M",
-                                                                                finalUsername
-                                                                        );
+                            if (!(result instanceof Integer)) {
+                                return;
+                            }
 
-                                                                scheduleTimeout();
-                                                            } catch (Throwable t) {
-                                                                log("调用 M() 失败: " + t);
-                                                                clearPending();
-                                                            }
-                                                        }
-                                                    },
-                                                    250L
-                                            );
-                                        } catch (Throwable t) {
-                                            log("准备原生用户名搜索失败: " + t);
-                                            clearPending();
-                                        }
-                                    }
-                                });
+                            int uid = (Integer) result;
+                            String name = readName(user);
 
-                            } catch (Throwable t) {
-                                log("goToProfile hook error: " + t);
+                            if (uid <= 0
+                                    || blank(name)
+                                    || pendingUsername == null
+                                    || !pendingUsername.equals(name)) {
+                                return;
+                            }
+
+                            Activity a = pendingActivity.get();
+
+                            if (a == null
+                                    || a.isFinishing()
+                                    || destroyed(a)) {
                                 clearPending();
+                                return;
                             }
+
+                            if (!pending.compareAndSet(true, false)) {
+                                return;
+                            }
+
+                            pendingUsername = null;
+                            pendingActivity =
+                                    new WeakReference<>(null);
+
+                            log("[BRIDGE] resolved "
+                                    + name + " -> " + uid);
+
+                            final Activity finalActivity = a;
+                            final Object finalUser = user;
+
+                            MAIN.post(() -> {
+                                callNativeProfile(
+                                        finalActivity,
+                                        finalUser
+                                );
+                            });
+
+                        } catch (Throwable t) {
+                            log("[BRIDGE] capture error: " + t);
                         }
                     }
-            );
+                }
+        );
 
-            log("SearchUserViewModel.goToProfile hook OK");
-        } catch (Throwable t) {
-            log("SearchUserViewModel.goToProfile hook FAIL: " + t);
-            XposedBridge.log(t);
-        }
+        log("rl0.e.T capture hook OK");
     }
 
-    // ---------------------------------------------------------------------
-    // 捕获原生用户名搜索返回的真实用户
-    //
-    // 原生 Paging 结果进入 adapter 后，会读取 rl0.e.T()。
-    // 只在 pending 状态下匹配同名、非零 userid。
-    // ---------------------------------------------------------------------
+    // ------------------------------------------------------------------
+    // 调用原生 sl0.c.e()
+    // ------------------------------------------------------------------
 
-    private static void hookResolvedUserCapture() {
-        try {
-            Class<?> itemClass =
-                    XposedHelpers.findClass("rl0.e", sCl);
-
-            XposedHelpers.findAndHookMethod(
-                    itemClass,
-                    "T",
-                    new XC_MethodHook() {
-                        @Override
-                        protected void afterHookedMethod(
-                                MethodHookParam param
-                        ) {
-                            try {
-                                if (!PENDING.get()) {
-                                    return;
-                                }
-
-                                Object item = param.thisObject;
-
-                                Object result =
-                                        param.getResult();
-
-                                if (!(result instanceof Integer)) {
-                                    return;
-                                }
-
-                                int uid = (Integer) result;
-
-                                if (uid <= 0) {
-                                    return;
-                                }
-
-                                String username =
-                                        readUsername(item);
-
-                                String wanted =
-                                        pendingUsername;
-
-                                if (isBlank(username)
-                                        || wanted == null
-                                        || !wanted.equals(username)) {
-                                    return;
-                                }
-
-                                Activity activity =
-                                        pendingActivity.get();
-
-                                if (activity == null
-                                        || activity.isFinishing()
-                                        || isDestroyed(activity)) {
-                                    log("匹配到真实用户，但 Activity 已失效");
-                                    clearPending();
-                                    return;
-                                }
-
-                                /*
-                                 * 只允许一个结果触发跳转。
-                                 */
-                                if (!PENDING.compareAndSet(true, false)) {
-                                    return;
-                                }
-
-                                pendingUsername = null;
-                                pendingActivity =
-                                        new WeakReference<>(null);
-                                pendingStartTime = 0L;
-
-                                log("匹配到真实用户: "
-                                        + username
-                                        + " -> "
-                                        + uid);
-
-                                final Activity finalActivity = activity;
-                                final Object finalItem = item;
-
-                                MAIN_HANDLER.post(new Runnable() {
-                                    @Override
-                                    public void run() {
-                                        invokeNativeProfileEntry(
-                                                finalActivity,
-                                                finalItem
-                                        );
-                                    }
-                                });
-
-                            } catch (Throwable t) {
-                                log("捕获真实用户失败: " + t);
-                            }
-                        }
-                    }
-            );
-
-            log("rl0.e.T capture hook OK");
-        } catch (Throwable t) {
-            log("rl0.e.T capture hook FAIL: " + t);
-            XposedBridge.log(t);
-        }
-    }
-
-    // ---------------------------------------------------------------------
-    // 调用原生最终主页入口
-    // ---------------------------------------------------------------------
-
-    private static void invokeNativeProfileEntry(
+    private static void callNativeProfile(
             Activity activity,
-            Object item
+            Object user
     ) {
         try {
-            Class<?> sl0Class =
-                    XposedHelpers.findClass("sl0.c", sCl);
+            Class<?> cls =
+                    XposedHelpers.findClass("sl0.c", cl);
 
             Object singleton =
-                    XposedHelpers.getStaticObjectField(
-                            sl0Class,
-                            "a"
-                    );
+                    XposedHelpers.getStaticObjectField(cls, "a");
 
-            /*
-             * UserNameSearchFragment.goToProfile() 的默认参数：
-             * source = user_filter_word
-             * filterType = SearchService
-             * position = 0
-             */
             XposedHelpers.callMethod(
                     singleton,
                     "e",
                     activity,
-                    item,
+                    user,
                     "user_filter_word",
                     "SearchService",
                     0
             );
 
-            log("已调用原生 sl0.c.e()");
+            log("[BRIDGE] native profile entry called");
         } catch (Throwable t) {
-            log("调用 sl0.c.e() 失败: " + t);
+            log("[BRIDGE] profile entry failed: " + t);
         }
     }
 
-    // ---------------------------------------------------------------------
-    // 找到当前 Activity 中的 UserNameSearchView
-    // ---------------------------------------------------------------------
+    // ------------------------------------------------------------------
+    // 查找当前 Activity 中的 UserNameSearchView
+    // ------------------------------------------------------------------
 
-    private static Object findCurrentNameSearchView(
-            Activity activity
-    ) {
+    private static Object findSearchView(Activity activity) {
         try {
-            Object cached = nameSearchView.get();
+            Object cached = searchView.get();
 
-            if (cached != null
-                    && belongsToActivity(cached, activity)) {
+            if (cached != null && belongsTo(cached, activity)) {
                 return cached;
             }
 
             View root =
                     activity.getWindow().getDecorView();
 
-            Object found =
-                    findViewByClass(
-                            root,
-                            "com.hellotalk.search.v2.widget.UserNameSearchView"
-                    );
+            Object found = findView(
+                    root,
+                    "com.hellotalk.search.v2.widget.UserNameSearchView"
+            );
 
             if (found != null) {
-                nameSearchView =
+                searchView =
                         new WeakReference<>(found);
             }
 
             return found;
         } catch (Throwable t) {
-            log("查找 UserNameSearchView 异常: " + t);
+            log("[BRIDGE] find view failed: " + t);
             return null;
         }
     }
 
-    private static Object findViewByClass(
-            View view,
-            String className
-    ) {
+    private static Object findView(View view, String className) {
         if (view == null) {
             return null;
         }
@@ -559,10 +425,7 @@ public class MainHook implements IXposedHookLoadPackage {
 
             for (int i = 0; i < group.getChildCount(); i++) {
                 Object result =
-                        findViewByClass(
-                                group.getChildAt(i),
-                                className
-                        );
+                        findView(group.getChildAt(i), className);
 
                 if (result != null) {
                     return result;
@@ -573,7 +436,7 @@ public class MainHook implements IXposedHookLoadPackage {
         return null;
     }
 
-    private static boolean belongsToActivity(
+    private static boolean belongsTo(
             Object view,
             Activity activity
     ) {
@@ -586,10 +449,8 @@ public class MainHook implements IXposedHookLoadPackage {
             }
 
             if (context instanceof ContextWrapper) {
-                Context base =
-                        ((ContextWrapper) context).getBaseContext();
-
-                return base == activity;
+                return ((ContextWrapper) context)
+                        .getBaseContext() == activity;
             }
         } catch (Throwable ignored) {
         }
@@ -597,74 +458,62 @@ public class MainHook implements IXposedHookLoadPackage {
         return false;
     }
 
-    // ---------------------------------------------------------------------
-    // pending 超时与字段读取
-    // ---------------------------------------------------------------------
+    // ------------------------------------------------------------------
+    // 状态与工具
+    // ------------------------------------------------------------------
 
-    private static void scheduleTimeout() {
-        final long requestTime = pendingStartTime;
+    private static void setTimeout() {
+        final long start = pendingTime;
 
-        MAIN_HANDLER.postDelayed(new Runnable() {
-            @Override
-            public void run() {
-                if (!PENDING.get()) {
-                    return;
-                }
-
-                if (pendingStartTime != requestTime) {
-                    return;
-                }
-
-                if (System.currentTimeMillis() - requestTime
-                        >= TIMEOUT_MS) {
-                    log("原生用户名搜索超时: " + pendingUsername);
-                    clearPending();
-                }
+        MAIN.postDelayed(() -> {
+            if (pending.get()
+                    && pendingTime == start
+                    && System.currentTimeMillis() - start >= TIMEOUT) {
+                log("[BRIDGE] timeout: " + pendingUsername);
+                clearPending();
             }
-        }, TIMEOUT_MS + 300L);
+        }, TIMEOUT + 500L);
     }
 
     private static void clearPending() {
-        synchronized (LOCK) {
-            PENDING.set(false);
-            pendingUsername = null;
-            pendingActivity =
-                    new WeakReference<>(null);
-            pendingStartTime = 0L;
-        }
+        pending.set(false);
+        pendingUsername = null;
+        pendingActivity =
+                new WeakReference<>(null);
+        pendingTime = 0L;
     }
 
-    private static int readUid(Object item) {
+    private static int readUid(Object user) {
         try {
-            Object result =
-                    XposedHelpers.callMethod(item, "T");
+            Object value =
+                    XposedHelpers.callMethod(user, "T");
 
-            return result instanceof Integer
-                    ? (Integer) result
+            return value instanceof Integer
+                    ? (Integer) value
                     : 0;
         } catch (Throwable t) {
             return 0;
         }
     }
 
-    private static String readUsername(Object item) {
+    private static String readName(Object user) {
         try {
-            Object result =
-                    XposedHelpers.getObjectField(item, "Y");
+            Object value =
+                    XposedHelpers.getObjectField(user, "Y");
 
-            return result == null
+            return value == null
                     ? null
-                    : String.valueOf(result);
+                    : String.valueOf(value);
         } catch (Throwable t) {
             return null;
         }
     }
 
-    private static boolean isBlank(String value) {
+    private static boolean blank(String value) {
         return value == null || value.trim().isEmpty();
     }
 
-    private static boolean isDestroyed(Activity activity) {
+    private static boolean destroyed(Activity activity) {
         try {
             return android.os.Build.VERSION.SDK_INT >= 17
                     && activity.isDestroyed();
@@ -673,7 +522,7 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    private static void log(String message) {
-        XposedBridge.log("[HT] " + message);
+    private static void log(String msg) {
+        XposedBridge.log("[HT] " + msg);
     }
 }
