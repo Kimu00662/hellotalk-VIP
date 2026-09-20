@@ -179,28 +179,30 @@ public class MainHook implements IXposedHookLoadPackage {
             }
 
             Object result = resultHolder[0];
-            if (result == null) { log("n91.s null"); return 0; }
+            if (result == null) { log("结果(result) null"); return 0; }
+            log("result类型: " + result.getClass().getName());
 
-            Object lcResp = XposedHelpers.callMethod(result, "a");
-            if (lcResp == null) { log("LCResponse null"); return 0; }
-
-            Method getData = null;
-            for (Method m : lcResp.getClass().getDeclaredMethods()) {
-                if (m.getParameterCount() == 0
-                        && !"getClass".equals(m.getName())
-                        && !"toString".equals(m.getName())
-                        && !"hashCode".equals(m.getName())) {
-                    getData = m;
-                    break;
-                }
+            // 直接读 n91.s 的字段 b（真正的数据体）
+            Object lcResp = null;
+            try {
+                lcResp = XposedHelpers.getObjectField(result, "b");
+            } catch (Throwable t) {
+                log("读字段b失败, 尝试.a()");
+                lcResp = XposedHelpers.callMethod(result, "a");
             }
-            if (getData == null) { log("找不到 getData"); return 0; }
-            getData.setAccessible(true);
-            Object rl0h = getData.invoke(lcResp);
-            if (rl0h == null) { log("rl0.h null"); return 0; }
+            if (lcResp == null) { log("lcResp(null)=null"); return 0; }
+            log("lcResp类型: " + lcResp.getClass().getName());
 
+            // 读 LCResponse 的 code 和 data
+            Object code = XposedHelpers.callMethod(lcResp, "getCode");
+            Object data = XposedHelpers.callMethod(lcResp, "getData");
+            log("code=" + code + ", data=" + data);
+            if (data == null) { log("data null, 可能code!=0"); return 0; }
+
+            // data 是 rl0.h
+            Object rl0h = data;
             List list = (List) XposedHelpers.callMethod(rl0h, "b");
-            if (list == null || list.isEmpty()) { log("结果为空"); return 0; }
+            if (list == null || list.isEmpty()) { log("列表为空"); return 0; }
 
             int realUid = getUid(list.get(0));
             log("反查结果 userid=" + realUid);
@@ -221,7 +223,6 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    // 获取 EmptyCoroutineContext 单例（混淆后为 d41.g，字段 n）
     static Object getEmptyCoroutineContext() {
         try {
             Class<?> e = XposedHelpers.findClass("d41.g", sCl);
