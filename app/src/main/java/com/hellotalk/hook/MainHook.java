@@ -7,11 +7,15 @@ import de.robv.android.xposed.XposedBridge;
 import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage.LoadPackageParam;
 
-import java.lang.reflect.Field;
+import java.lang.reflect.Method;
+import java.lang.reflect.Proxy;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 public class MainHook implements IXposedHookLoadPackage {
 
     private static ClassLoader sCl;
+    private static volatile boolean resolving = false;
 
     @Override
     public void handleLoadPackage(final LoadPackageParam lpparam) {
@@ -20,8 +24,8 @@ public class MainHook implements IXposedHookLoadPackage {
 
         hookVip();
         hookTranslate();
-        hookGson();      // 抓 SearchResp 的原始 JSON
-        hookItem();      // 抓每个 rl0.e 的 userid + 字段是否真实存在
+        hookGson();
+        hookItem();
     }
 
     private void hookVip() {
@@ -40,12 +44,9 @@ public class MainHook implements IXposedHookLoadPackage {
         } catch (Throwable t) { log("翻译 FAIL: " + t); }
     }
 
-    // 抓 Gson.fromJson(String, Class)，当目标是 SearchResp(rl0.h) 时打印原始 JSON
     private void hookGson() {
         try {
             Class<?> gsonCls = XposedHelpers.findClass("com.google.gson.Gson", sCl);
-            Class<?> respCls = XposedHelpers.findClass("rl0.h", sCl);
-
             XposedHelpers.findAndHookMethod(gsonCls, "fromJson",
                     String.class, Class.class,
                     new XC_MethodHook() {
@@ -55,15 +56,14 @@ public class MainHook implements IXposedHookLoadPackage {
                                 Class<?> target = (Class<?>) param.args[1];
                                 if (target != null && target.getName().equals("rl0.h")) {
                                     String json = (String) param.args[0];
-                                    log("========= SearchResp 原始JSON =========");
-                                    if (json != null && json.length() > 3000) {
-                                        log(json.substring(0, 3000));
-                                    } else {
+                                    log("=== SearchResp JSON ===");
+                                    if (json != null && json.length() > 2500)
+                                        log(json.substring(0, 2500));
+                                    else
                                         log(String.valueOf(json));
-                                    }
-                                    log("========= 原始JSON END =========");
+                                    log("=== END ===");
                                 }
-                            } catch (Throwable t) { log("gson hook err: " + t); }
+                            } catch (Throwable t) {}
                         }
                     });
             log("Gson hook OK");
@@ -72,7 +72,7 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    // 抓 rl0.e.T() 被调用时打印 userid；并 dump 该对象所有字段值
+    // 当某个 item 的 userid=0（脱敏）时，自动用它的 username 去反查
     private void hookItem() {
         try {
             XposedHelpers.findAndHookMethod("rl0.e", sCl, "T",
@@ -81,15 +81,26 @@ public class MainHook implements IXposedHookLoadPackage {
                         protected void afterHookedMethod(MethodHookParam param) {
                             try {
                                 Object item = param.thisObject;
-                                Object uid = param.getResult();
+                                Object uidObj = param.getResult();
+                                int uid = (uidObj == null) ? 0 : ((Integer) uidObj);
                                 Object y = XposedHelpers.getObjectField(item, "Y");
-                                StringBuilder sb = new StringBuilder();
-                                sb.append("item userid=").append(uid)
-                                  .append(", username=").append(y);
-                                // dump 部分关键字段
-                                sb.append(", sex=").append(safeField(item, "N"));
-                                sb.append(", country=").append(safeField(item, "B"));
-                                log(sb.toString());
+                                String uname = (y == null) ? null : y.toString();
+
+                                log("item userid=" + uid + ", username=" + uname);
+
+                                // userid=0 且不在反查中 → 触发反查
+                                if (uid == 0 && uname != null && !uname.isEmpty() && !resolving) {
+                                    resolving = true;
+                                    log(">>> 触发反查 username=" + uname);
+                                    final String nick = uname;
+                                    new Thread(() -> {
+                                        try {
+                                            resolveUidByUsername(nick);
+                                        } finally {
+                                            resolving = false;
+                                        }
+                                    }).start();
+                                }
                             } catch (Throwable t) {}
                         }
                     });
@@ -99,9 +110,91 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    private static Object safeField(Object obj, String name) {
-        try { return XposedHelpers.getObjectField(obj, name); }
-        catch (Throwable t) { return "?"; }
+    static int resolveUidByUsername(String username) {
+        if (username == null || username.isEmpty()) return 0;
+        String nick = username.startsWith("@") ? username.substring(1) : username;
+        log("反查传入 nickname=[" + nick + "] len=" + nick.length());
+        try {
+            Class<?> ql0c = XposedHelpers.findClass("ql0.c", sCl);
+            Class<?> m41f0 = XposedHelpers.findClass("m41.f0", sCl);
+            Class<?> qh0a = XposedHelpers.findClass("qh0.a", sCl);
+
+            Object wrapped = XposedHelpers.callStaticMethod(m41f0, "b", ql0c);
+            Object api = XposedHelpers.callStaticMethod(qh0a, "a", wrapped);
+
+            Class<?> d41d = XposedHelpers.findClass("d41.d", sCl);
+            Method gMethod = null;
+            for (Method m : ql0c.getDeclaredMethods()) {
+                if ("g".equals(m.getName())
+                        && m.getParameterCount() == 4
+                        && m.getParameterTypes()[0] == int.class) {
+                    gMethod = m; break;
+                }
+            }
+            if (gMethod == null) { log("找不到 g 方法"); return 0; }
+            gMethod.setAccessible(true);
+
+            final Object emptyContext = getEmptyCoroutineContext();
+            final CountDownLatch latch = new CountDownLatch(1);
+            final Object[] holder = new Object[1];
+
+            Object continuation = Proxy.newProxyInstance(sCl,
+                    new Class[]{ d41d },
+                    (proxy, method, args) -> {
+                        if ("resumeWith".equals(method.getName())) {
+                            holder[0] = args[0];
+                            latch.countDown();
+                            return null;
+                        }
+                        if ("getContext".equals(method.getName())) return emptyContext;
+                        return null;
+                    });
+
+            gMethod.invoke(api, 1, 15, nick, continuation);
+
+            if (!latch.await(10, TimeUnit.SECONDS)) { log("反查超时"); return 0; }
+
+            Object result = holder[0];
+            if (result == null) { log("result null"); return 0; }
+
+            Object lcResp = XposedHelpers.getObjectField(result, "b");
+            Object code = XposedHelpers.callMethod(lcResp, "getCode");
+            Object data = XposedHelpers.callMethod(lcResp, "getData");
+            log("universal code=" + code + " data=" + data);
+            if (data == null) { log("data null"); return 0; }
+
+            java.util.List list = (java.util.List) XposedHelpers.callMethod(data, "b");
+            if (list == null || list.isEmpty()) { log("列表空"); return 0; }
+
+            int realUid = 0;
+            for (Object it : list) {
+                Object uid = XposedHelpers.getObjectField(it, "T");
+                Object uy = XposedHelpers.getObjectField(it, "Y");
+                log("  候选: userid=" + uid + " username=" + uy);
+                int v = (uid == null) ? 0 : ((Integer) uid);
+                if (v != 0) { realUid = v; break; }
+            }
+            log("反查最终 realUid=" + realUid);
+            return realUid;
+
+        } catch (Throwable t) {
+            log("resolveUid FAIL: " + t);
+            Throwable real = t;
+            while (real instanceof java.lang.reflect.InvocationTargetException
+                    && real.getCause() != null) real = real.getCause();
+            log("  ★真正原因: " + real);
+            return 0;
+        }
+    }
+
+    static Object getEmptyCoroutineContext() {
+        try {
+            Class<?> e = XposedHelpers.findClass("d41.g", sCl);
+            return XposedHelpers.getStaticObjectField(e, "n");
+        } catch (Throwable t) {
+            log("getEmptyCoroutineContext 失败: " + t);
+            return null;
+        }
     }
 
     static void log(String msg) {
