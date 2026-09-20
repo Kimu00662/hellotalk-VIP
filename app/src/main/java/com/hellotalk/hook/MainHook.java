@@ -24,8 +24,8 @@ public class MainHook implements IXposedHookLoadPackage {
 
         hookVip();
         hookTranslate();
-        hookHeaderLog();      // zh0.a：加头前
-        hookFinalHeader();    // ★ 新增：ai0.c / zh0.b 最终请求
+        hookHeaderLog();
+        hookFinalHeader();
         hookItem();
     }
 
@@ -53,19 +53,7 @@ public class MainHook implements IXposedHookLoadPackage {
                     new XC_MethodHook() {
                         @Override
                         protected void beforeHookedMethod(MethodHookParam param) {
-                            try {
-                                Object chain = param.args[0];
-                                Object request = XposedHelpers.callMethod(chain, "request");
-                                Object url = XposedHelpers.callMethod(request, "url");
-                                String urlStr = url.toString();
-                                if (urlStr.contains("/go_user_search/v2/universal")) {
-                                    Object headers = XposedHelpers.callMethod(request, "headers");
-                                    log("=== [zh0.a] universal 请求头(加头前) ===");
-                                    log("URL: " + urlStr);
-                                    log("Headers:\n" + headers.toString());
-                                    log("=== END ===");
-                                }
-                            } catch (Throwable t) {}
+                            dumpReq("zh0.a(加头前)", param);
                         }
                     });
             log("HeaderLog hook OK");
@@ -74,7 +62,6 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    // ★ 打印链上更靠后的拦截器(ai0.c / zh0.b)拿到的"最终请求头"
     private void hookFinalHeader() {
         Class<?> chainCls;
         try { chainCls = XposedHelpers.findClass("okhttp3.Interceptor$Chain", sCl); }
@@ -120,12 +107,7 @@ public class MainHook implements IXposedHookLoadPackage {
             String urlStr = url.toString();
             if (!urlStr.contains("/go_user_search/v2/universal")) return;
             Object headers = XposedHelpers.callMethod(request, "headers");
-            StringBuilder sb = new StringBuilder();
-            sb.append("=== [").append(tag).append("] 最终请求 ===\n");
-            sb.append("URL: ").append(urlStr).append("\n");
-            sb.append("Headers:\n").append(headers.toString());
-            log(sb.toString());
-            log("=== END ===");
+            log("=== [" + tag + "] universal 请求 ===\nURL: " + urlStr + "\nHeaders:\n" + headers.toString() + "\n=== END ===");
         } catch (Throwable t) {}
     }
 
@@ -150,10 +132,12 @@ public class MainHook implements IXposedHookLoadPackage {
                                 int uid = (uidObj == null) ? 0 : ((Integer) uidObj);
                                 Object y = XposedHelpers.getObjectField(item, "Y");
                                 String uname = (y == null) ? null : y.toString();
+
                                 log("item userid=" + uid + ", username=" + uname);
+
                                 if (uid == 0 && uname != null && !uname.isEmpty() && !resolving) {
                                     resolving = true;
-                                    log(">>> 触发反查 username=" + uname);
+                                    log(">>> 触发反查(慢速) username=" + uname);
                                     final String nick = uname;
                                     new Thread(() -> {
                                         try { resolveUidByUsername(nick); }
@@ -172,12 +156,17 @@ public class MainHook implements IXposedHookLoadPackage {
         String nick = username.startsWith("@") ? username.substring(1) : username;
         log("反查传入 nickname=[" + nick + "] len=" + nick.length());
         try {
+            // ★ 先等 3 秒，模拟人工节奏
+            Thread.sleep(3000);
+            long t0 = System.currentTimeMillis();
+
             Class<?> ql0c = XposedHelpers.findClass("ql0.c", sCl);
             Class<?> m41f0 = XposedHelpers.findClass("m41.f0", sCl);
             Class<?> qh0a = XposedHelpers.findClass("qh0.a", sCl);
 
             Object wrapped = XposedHelpers.callStaticMethod(m41f0, "b", ql0c);
             Object api = XposedHelpers.callStaticMethod(qh0a, "a", wrapped);
+            log("反查 API 获取耗时=" + (System.currentTimeMillis() - t0) + "ms");
 
             Class<?> d41d = XposedHelpers.findClass("d41.d", sCl);
             Method gMethod = null;
@@ -206,7 +195,9 @@ public class MainHook implements IXposedHookLoadPackage {
 
             gMethod.invoke(api, 1, 15, nick, continuation);
 
-            if (!latch.await(10, TimeUnit.SECONDS)) { log("反查超时"); return 0; }
+            if (!latch.await(15, TimeUnit.SECONDS)) { log("反查超时"); return 0; }
+            log("反查总耗时=" + (System.currentTimeMillis() - t0) + "ms");
+
             Object result = holder[0];
             if (result == null) { log("result null"); return 0; }
 
