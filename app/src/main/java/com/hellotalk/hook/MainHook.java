@@ -24,8 +24,8 @@ public class MainHook implements IXposedHookLoadPackage {
 
         hookVip();
         hookTranslate();
-        hookGson();
-        hookHeaderLog();   // ★ 新增：打印 universal 请求的完整头
+        hookHeaderLog();      // zh0.a：加头前
+        hookFinalHeader();    // ★ 新增：ai0.c / zh0.b 最终请求
         hookItem();
     }
 
@@ -45,35 +45,6 @@ public class MainHook implements IXposedHookLoadPackage {
         } catch (Throwable t) { log("翻译 FAIL: " + t); }
     }
 
-    private void hookGson() {
-        try {
-            Class<?> gsonCls = XposedHelpers.findClass("com.google.gson.Gson", sCl);
-            XposedHelpers.findAndHookMethod(gsonCls, "fromJson",
-                    String.class, Class.class,
-                    new XC_MethodHook() {
-                        @Override
-                        protected void afterHookedMethod(MethodHookParam param) {
-                            try {
-                                Class<?> target = (Class<?>) param.args[1];
-                                if (target != null && target.getName().equals("rl0.h")) {
-                                    String json = (String) param.args[0];
-                                    log("=== SearchResp JSON ===");
-                                    if (json != null && json.length() > 2500)
-                                        log(json.substring(0, 2500));
-                                    else
-                                        log(String.valueOf(json));
-                                    log("=== END ===");
-                                }
-                            } catch (Throwable t) {}
-                        }
-                    });
-            log("Gson hook OK");
-        } catch (Throwable t) {
-            log("Gson hook FAIL: " + t);
-        }
-    }
-
-    // ★ 打印经过 zh0.a（加头拦截器）的 universal 请求的完整 header
     private void hookHeaderLog() {
         try {
             Class<?> zh0a = XposedHelpers.findClass("zh0.a", sCl);
@@ -81,7 +52,7 @@ public class MainHook implements IXposedHookLoadPackage {
             XposedHelpers.findAndHookMethod(zh0a, "intercept", chainCls,
                     new XC_MethodHook() {
                         @Override
-                        protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+                        protected void beforeHookedMethod(MethodHookParam param) {
                             try {
                                 Object chain = param.args[0];
                                 Object request = XposedHelpers.callMethod(chain, "request");
@@ -89,7 +60,7 @@ public class MainHook implements IXposedHookLoadPackage {
                                 String urlStr = url.toString();
                                 if (urlStr.contains("/go_user_search/v2/universal")) {
                                     Object headers = XposedHelpers.callMethod(request, "headers");
-                                    log("=== [zh0.a] universal 请求头 ===");
+                                    log("=== [zh0.a] universal 请求头(加头前) ===");
                                     log("URL: " + urlStr);
                                     log("Headers:\n" + headers.toString());
                                     log("=== END ===");
@@ -101,6 +72,70 @@ public class MainHook implements IXposedHookLoadPackage {
         } catch (Throwable t) {
             log("HeaderLog hook FAIL: " + t);
         }
+    }
+
+    // ★ 打印链上更靠后的拦截器(ai0.c / zh0.b)拿到的"最终请求头"
+    private void hookFinalHeader() {
+        Class<?> chainCls;
+        try { chainCls = XposedHelpers.findClass("okhttp3.Interceptor$Chain", sCl); }
+        catch (Throwable t) { log("找不到 Chain: " + t); return; }
+
+        try {
+            Class<?> ai0c = XposedHelpers.findClass("ai0.c", sCl);
+            XposedHelpers.findAndHookMethod(ai0c, "intercept", chainCls,
+                new XC_MethodHook() {
+                    @Override
+                    protected void beforeHookedMethod(MethodHookParam param) { dumpReq("ai0.c", param); }
+                    @Override
+                    protected void afterHookedMethod(MethodHookParam param) {
+                        try {
+                            if (!isUniversal(param)) return;
+                            Object resp = param.getResult();
+                            if (resp != null) {
+                                Object code = XposedHelpers.callMethod(resp, "code");
+                                log("[ai0.c] response code=" + code);
+                            }
+                        } catch (Throwable t) {}
+                    }
+                });
+            log("ai0.c hook OK");
+        } catch (Throwable t) { log("ai0.c hook FAIL: " + t); }
+
+        try {
+            Class<?> zh0b = XposedHelpers.findClass("zh0.b", sCl);
+            XposedHelpers.findAndHookMethod(zh0b, "intercept", chainCls,
+                new XC_MethodHook() {
+                    @Override
+                    protected void beforeHookedMethod(MethodHookParam param) { dumpReq("zh0.b", param); }
+                });
+            log("zh0.b hook OK");
+        } catch (Throwable t) { log("zh0.b hook FAIL: " + t); }
+    }
+
+    private static void dumpReq(String tag, XC_MethodHook.MethodHookParam param) {
+        try {
+            Object chain = param.args[0];
+            Object request = XposedHelpers.callMethod(chain, "request");
+            Object url = XposedHelpers.callMethod(request, "url");
+            String urlStr = url.toString();
+            if (!urlStr.contains("/go_user_search/v2/universal")) return;
+            Object headers = XposedHelpers.callMethod(request, "headers");
+            StringBuilder sb = new StringBuilder();
+            sb.append("=== [").append(tag).append("] 最终请求 ===\n");
+            sb.append("URL: ").append(urlStr).append("\n");
+            sb.append("Headers:\n").append(headers.toString());
+            log(sb.toString());
+            log("=== END ===");
+        } catch (Throwable t) {}
+    }
+
+    private static boolean isUniversal(XC_MethodHook.MethodHookParam param) {
+        try {
+            Object chain = param.args[0];
+            Object request = XposedHelpers.callMethod(chain, "request");
+            Object url = XposedHelpers.callMethod(request, "url");
+            return url.toString().contains("/go_user_search/v2/universal");
+        } catch (Throwable t) { return false; }
     }
 
     private void hookItem() {
@@ -115,28 +150,21 @@ public class MainHook implements IXposedHookLoadPackage {
                                 int uid = (uidObj == null) ? 0 : ((Integer) uidObj);
                                 Object y = XposedHelpers.getObjectField(item, "Y");
                                 String uname = (y == null) ? null : y.toString();
-
                                 log("item userid=" + uid + ", username=" + uname);
-
                                 if (uid == 0 && uname != null && !uname.isEmpty() && !resolving) {
                                     resolving = true;
                                     log(">>> 触发反查 username=" + uname);
                                     final String nick = uname;
                                     new Thread(() -> {
-                                        try {
-                                            resolveUidByUsername(nick);
-                                        } finally {
-                                            resolving = false;
-                                        }
+                                        try { resolveUidByUsername(nick); }
+                                        finally { resolving = false; }
                                     }).start();
                                 }
                             } catch (Throwable t) {}
                         }
                     });
             log("Item hook OK");
-        } catch (Throwable t) {
-            log("Item hook FAIL: " + t);
-        }
+        } catch (Throwable t) { log("Item hook FAIL: " + t); }
     }
 
     static int resolveUidByUsername(String username) {
@@ -154,8 +182,7 @@ public class MainHook implements IXposedHookLoadPackage {
             Class<?> d41d = XposedHelpers.findClass("d41.d", sCl);
             Method gMethod = null;
             for (Method m : ql0c.getDeclaredMethods()) {
-                if ("g".equals(m.getName())
-                        && m.getParameterCount() == 4
+                if ("g".equals(m.getName()) && m.getParameterCount() == 4
                         && m.getParameterTypes()[0] == int.class) {
                     gMethod = m; break;
                 }
@@ -171,9 +198,7 @@ public class MainHook implements IXposedHookLoadPackage {
                     new Class[]{ d41d },
                     (proxy, method, args) -> {
                         if ("resumeWith".equals(method.getName())) {
-                            holder[0] = args[0];
-                            latch.countDown();
-                            return null;
+                            holder[0] = args[0]; latch.countDown(); return null;
                         }
                         if ("getContext".equals(method.getName())) return emptyContext;
                         return null;
@@ -182,7 +207,6 @@ public class MainHook implements IXposedHookLoadPackage {
             gMethod.invoke(api, 1, 15, nick, continuation);
 
             if (!latch.await(10, TimeUnit.SECONDS)) { log("反查超时"); return 0; }
-
             Object result = holder[0];
             if (result == null) { log("result null"); return 0; }
 
@@ -226,7 +250,5 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    static void log(String msg) {
-        XposedBridge.log("[HT] " + msg);
-    }
+    static void log(String msg) { XposedBridge.log("[HT] " + msg); }
 }
