@@ -25,6 +25,7 @@ public class MainHook implements IXposedHookLoadPackage {
         hookVip();
         hookTranslate();
         hookGson();
+        hookHeaderLog();   // ★ 新增：打印 universal 请求的完整头
         hookItem();
     }
 
@@ -72,7 +73,36 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    // 当某个 item 的 userid=0（脱敏）时，自动用它的 username 去反查
+    // ★ 打印经过 zh0.a（加头拦截器）的 universal 请求的完整 header
+    private void hookHeaderLog() {
+        try {
+            Class<?> zh0a = XposedHelpers.findClass("zh0.a", sCl);
+            Class<?> chainCls = XposedHelpers.findClass("okhttp3.Interceptor$Chain", sCl);
+            XposedHelpers.findAndHookMethod(zh0a, "intercept", chainCls,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+                            try {
+                                Object chain = param.args[0];
+                                Object request = XposedHelpers.callMethod(chain, "request");
+                                Object url = XposedHelpers.callMethod(request, "url");
+                                String urlStr = url.toString();
+                                if (urlStr.contains("/go_user_search/v2/universal")) {
+                                    Object headers = XposedHelpers.callMethod(request, "headers");
+                                    log("=== [zh0.a] universal 请求头 ===");
+                                    log("URL: " + urlStr);
+                                    log("Headers:\n" + headers.toString());
+                                    log("=== END ===");
+                                }
+                            } catch (Throwable t) {}
+                        }
+                    });
+            log("HeaderLog hook OK");
+        } catch (Throwable t) {
+            log("HeaderLog hook FAIL: " + t);
+        }
+    }
+
     private void hookItem() {
         try {
             XposedHelpers.findAndHookMethod("rl0.e", sCl, "T",
@@ -88,7 +118,6 @@ public class MainHook implements IXposedHookLoadPackage {
 
                                 log("item userid=" + uid + ", username=" + uname);
 
-                                // userid=0 且不在反查中 → 触发反查
                                 if (uid == 0 && uname != null && !uname.isEmpty() && !resolving) {
                                     resolving = true;
                                     log(">>> 触发反查 username=" + uname);
