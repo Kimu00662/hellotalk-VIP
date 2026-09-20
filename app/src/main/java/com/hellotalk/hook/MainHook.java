@@ -63,13 +63,6 @@ public class MainHook implements IXposedHookLoadPackage {
 
         sCl = lpparam.classLoader;
 
-        try {
-            sMainHandler =
-                    new Handler(Looper.getMainLooper());
-        } catch (Throwable t) {
-            log("Handler初始化失败: " + t);
-        }
-
         safe(new HookTask() {
             @Override
             public void run() throws Throwable {
@@ -99,6 +92,20 @@ public class MainHook implements IXposedHookLoadPackage {
             @Override
             public void run() throws Throwable {
                 hookMomentVipType();
+            }
+        });
+
+        safe(new HookTask() {
+            @Override
+            public void run() throws Throwable {
+                hookMomentLatestCondition();
+            }
+        });
+
+        safe(new HookTask() {
+            @Override
+            public void run() throws Throwable {
+                hookMomentHistoryCondition();
             }
         });
 
@@ -153,12 +160,40 @@ public class MainHook implements IXposedHookLoadPackage {
             h = sMainHandler;
 
             if (h == null) {
-                h = new Handler(Looper.getMainLooper());
-                sMainHandler = h;
+                try {
+                    h = new Handler(Looper.getMainLooper());
+                    sMainHandler = h;
+                } catch (Throwable t) {
+                    log("Handler懒加载失败: " + t);
+                    return null;
+                }
             }
         }
 
         return h;
+    }
+
+    private static boolean post(Runnable task) {
+        try {
+            Handler h = handler();
+            return h != null && h.post(task);
+        } catch (Throwable t) {
+            log("Handler post失败: " + t);
+            return false;
+        }
+    }
+
+    private static boolean postDelayed(
+            Runnable task,
+            long delayMs
+    ) {
+        try {
+            Handler h = handler();
+            return h != null && h.postDelayed(task, delayMs);
+        } catch (Throwable t) {
+            log("Handler postDelayed失败: " + t);
+            return false;
+        }
     }
 
     // ============================================================
@@ -291,6 +326,15 @@ public class MainHook implements IXposedHookLoadPackage {
                             Object condition =
                                     param.getResult();
 
+                            int qtype =
+                                    param.args.length > 0
+                                            && param.args[0] instanceof Integer
+                                            ? (Integer) param.args[0]
+                                            : -1;
+
+                            int vipBefore =
+                                    readMomentVipType(conditionClass, condition);
+
                             if (condition == null
                                     || !conditionClass.isInstance(
                                     condition
@@ -333,6 +377,11 @@ public class MainHook implements IXposedHookLoadPackage {
                                     modified
                             )) {
                                 param.setResult(modified);
+                                log("[MOMENT] h called qtype="
+                                        + qtype
+                                        + " vip before="
+                                        + vipBefore
+                                        + " vip after=101");
                             }
 
                         } catch (Throwable ignored) {
@@ -345,6 +394,107 @@ public class MainHook implements IXposedHookLoadPackage {
         );
 
         log("Moment FeaturedCondition.vipType hook OK");
+    }
+
+    private static void hookMomentLatestCondition()
+            throws Throwable {
+        final Class<?> requestClass =
+                XposedHelpers.findClass(
+                        "ze0.i",
+                        sCl
+                );
+
+        final Class<?> conditionClass =
+                XposedHelpers.findClass(
+                        "com.hellotalk.ht.base.pbModel.MomentPb$FeaturedCondition",
+                        sCl
+                );
+
+        XposedHelpers.findAndHookMethod(
+                requestClass,
+                "e",
+                conditionClass,
+                new XC_MethodHook() {
+                    @Override
+                    protected void afterHookedMethod(
+                            MethodHookParam param
+                    ) {
+                        try {
+                            Object condition = param.args[0];
+                            int vip = readMomentVipType(
+                                    conditionClass,
+                                    condition
+                            );
+                            log("[MOMENT] latest condition vip=" + vip);
+                        } catch (Throwable ignored) {
+                        }
+                    }
+                }
+        );
+
+        log("Moment latest condition hook OK");
+    }
+
+    private static void hookMomentHistoryCondition()
+            throws Throwable {
+        final Class<?> requestClass =
+                XposedHelpers.findClass(
+                        "ze0.h",
+                        sCl
+                );
+
+        final Class<?> conditionClass =
+                XposedHelpers.findClass(
+                        "com.hellotalk.ht.base.pbModel.MomentPb$FeaturedCondition",
+                        sCl
+                );
+
+        XposedHelpers.findAndHookMethod(
+                requestClass,
+                "f",
+                conditionClass,
+                new XC_MethodHook() {
+                    @Override
+                    protected void afterHookedMethod(
+                            MethodHookParam param
+                    ) {
+                        try {
+                            Object condition = param.args[0];
+                            int vip = readMomentVipType(
+                                    conditionClass,
+                                    condition
+                            );
+                            log("[MOMENT] history condition vip=" + vip);
+                        } catch (Throwable ignored) {
+                        }
+                    }
+                }
+        );
+
+        log("Moment history condition hook OK");
+    }
+
+    private static int readMomentVipType(
+            Class<?> conditionClass,
+            Object condition
+    ) {
+        if (condition == null
+                || conditionClass == null
+                || !conditionClass.isInstance(condition)) {
+            return -1;
+        }
+
+        try {
+            Object value = XposedHelpers.callMethod(
+                    condition,
+                    "getVipType"
+            );
+            return value instanceof Integer
+                    ? (Integer) value
+                    : -1;
+        } catch (Throwable ignored) {
+            return -1;
+        }
     }
 
     // ============================================================
@@ -440,7 +590,7 @@ public class MainHook implements IXposedHookLoadPackage {
                                 final int finalUid =
                                         cached;
 
-                                handler().post(
+                                post(
                                         new Runnable() {
                                             @Override
                                             public void run() {
@@ -743,7 +893,7 @@ public class MainHook implements IXposedHookLoadPackage {
 
                             log("[BRIDGE] UserNameSearchFragment ready");
 
-                            handler().post(
+                            post(
                                     new Runnable() {
                                         @Override
                                         public void run() {
@@ -933,7 +1083,7 @@ public class MainHook implements IXposedHookLoadPackage {
 
         emptyCheckToken = token;
 
-        handler().postDelayed(
+        postDelayed(
                 new Runnable() {
                     @Override
                     public void run() {
@@ -1125,7 +1275,7 @@ public class MainHook implements IXposedHookLoadPackage {
                 + " -> "
                 + uid);
 
-        handler().post(
+        post(
                 new Runnable() {
                     @Override
                     public void run() {
@@ -1222,7 +1372,7 @@ public class MainHook implements IXposedHookLoadPackage {
     private static void scheduleTimeout(
             final long token
     ) {
-        handler().postDelayed(
+        postDelayed(
                 new Runnable() {
                     @Override
                     public void run() {
