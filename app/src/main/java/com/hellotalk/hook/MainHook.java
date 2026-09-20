@@ -29,7 +29,6 @@ public class MainHook implements IXposedHookLoadPackage {
         hookProfile();
     }
 
-    // ============ Hook 1: 假VIP ============
     private void hookVip() {
         try {
             XposedHelpers.findAndHookMethod("xt.h", sCl, "j",
@@ -38,7 +37,6 @@ public class MainHook implements IXposedHookLoadPackage {
         } catch (Throwable t) { log("假VIP FAIL: " + t); }
     }
 
-    // ============ Hook 2: 无限翻译 ============
     private void hookTranslate() {
         try {
             XposedHelpers.findAndHookMethod("lx.o", sCl, "h",
@@ -47,13 +45,9 @@ public class MainHook implements IXposedHookLoadPackage {
         } catch (Throwable t) { log("翻译 FAIL: " + t); }
     }
 
-    // ============ Hook 3: 搜索打开主页 ============
     private void hookProfile() {
         try {
             Class<?> rl0e = XposedHelpers.findClass("rl0.e", sCl);
-            // 注意：原始 smali 里是 virtual call（非 static），实际调用点是 static variant
-            // 我们 hook 调用点更稳定的 sl0/c;->e (public static synthetic)
-            // 但为保险，同时 hook SearchListViewModel.startToProfile
             XposedHelpers.findAndHookMethod(
                     "com.hellotalk.search.v2.viewmodel.SearchListViewModel",
                     sCl, "startToProfile",
@@ -70,22 +64,20 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    // 共用 hook 逻辑
     static class ProfileHook extends XC_MethodHook {
-        static volatile ThreadLocal<Boolean> inResolve = new ThreadLocal<>();
+        static ThreadLocal<Boolean> inResolve = new ThreadLocal<>();
 
         @Override
         protected void beforeHookedMethod(MethodHookParam param) {
             try {
-                // 防止递归回调
                 if (Boolean.TRUE.equals(inResolve.get())) {
                     inResolve.remove();
                     return;
                 }
 
-                Object item = param.args[1]; // rl0.e
-                int uid = XposedHelpers.getIntField(item, "T");
-                if (uid != 0) return; // 真实 ID，直接放行
+                Object item = param.args[1];
+                int uid = getUid(item);
+                if (uid != 0) return; // 真实ID，放行
 
                 String username = (String) XposedHelpers.getObjectField(item, "Y");
                 final Object[] args = param.args;
@@ -93,19 +85,15 @@ public class MainHook implements IXposedHookLoadPackage {
                 final Object thiz = param.thisObject;
                 final Activity activity = (Activity) param.args[0];
 
-                log("检测到脱敏用户: " + username + "，开始反查...");
-
-                // 阻止原方法执行
+                log("检测到脱敏用户: " + username + "，反查中...");
                 param.setResult(null);
 
-                // 后台线程反查
                 new Thread(() -> {
                     try {
                         int realUid = resolveUidByUsername(username);
                         if (realUid > 0) {
-                            XposedHelpers.setIntField(item, "T", realUid);
+                            injectUid(item, realUid);
                             log("反查成功: " + username + " -> " + realUid);
-                            // 回到主线程重新执行原方法
                             activity.runOnUiThread(() -> {
                                 try {
                                     inResolve.set(true);
@@ -128,19 +116,28 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    // ============ 反查真实 userid（同步调用 suspend 接口） ============
-    private static int resolveUidByUsername(String username) {
+    static int getUid(Object item) {
         try {
-            // 1. 获取 ql0/c Retrofit proxy
+            Object o = XposedHelpers.getObjectField(item, "T");
+            return (o == null) ? 0 : ((Integer) o);
+        } catch (Throwable t) { return 0; }
+    }
+
+    static void injectUid(Object item, int uid) {
+        try {
+            XposedHelpers.setObjectField(item, "T", Integer.valueOf(uid));
+        } catch (Throwable t) {}
+    }
+
+    static int resolveUidByUsername(String username) {
+        try {
             Class<?> ql0c = XposedHelpers.findClass("ql0.c", sCl);
             Class<?> m41f0 = XposedHelpers.findClass("m41.f0", sCl);
             Class<?> qh0a = XposedHelpers.findClass("qh0.a", sCl);
-            Class<?> t41d = XposedHelpers.findClass("t41.d", sCl);
 
             Object wrapped = XposedHelpers.callStaticMethod(m41f0, "b", ql0c);
             Object api = XposedHelpers.callStaticMethod(qh0a, "a", wrapped);
 
-            // 2. 找到 g 方法
             Class<?> d41d = XposedHelpers.findClass("d41.d", sCl);
             Method gMethod = null;
             for (Method m : ql0c.getDeclaredMethods()) {
@@ -151,16 +148,11 @@ public class MainHook implements IXposedHookLoadPackage {
                     break;
                 }
             }
-            if (gMethod == null) {
-                log("找不到 ql0.c.g 方法");
-                return 0;
-            }
+            if (gMethod == null) { log("找不到 g 方法"); return 0; }
             gMethod.setAccessible(true);
 
-            // 3. CountDownLatch + Continuation proxy
             final CountDownLatch latch = new CountDownLatch(1);
             final Object[] resultHolder = new Object[1];
-            final Exception[] errorHolder = new Exception[1];
 
             Object continuation = Proxy.newProxyInstance(sCl,
                     new Class[]{ d41d },
@@ -172,27 +164,20 @@ public class MainHook implements IXposedHookLoadPackage {
                         return null;
                     });
 
-            // 4. 反射调用 Retrofit proxy
             log("调用 ql0.c.g...");
             gMethod.invoke(api, 1, 20, username, continuation);
 
-            // 5. 等待结果（最多 10 秒）
             if (!latch.await(10, TimeUnit.SECONDS)) {
                 log("反查超时");
                 return 0;
             }
 
-            // 6. 解析结果: n91.s → .a() → LCResponse → .getData() → rl0.h → .b() → list → first → .T()
-            Object result = resultHolder[0]; // n91.s
-            if (result == null) {
-                log("n91.s 为 null");
-                return 0;
-            }
-            Object lcResp = XposedHelpers.callMethod(result, "a"); // .a() = body
-            if (lcResp == null) {
-                log("LCResponse 为 null");
-                return 0;
-            }
+            Object result = resultHolder[0];
+            if (result == null) { log("n91.s null"); return 0; }
+
+            Object lcResp = XposedHelpers.callMethod(result, "a");
+            if (lcResp == null) { log("LCResponse null"); return 0; }
+
             Method getData = null;
             for (Method m : lcResp.getClass().getDeclaredMethods()) {
                 if (m.getParameterCount() == 0
@@ -205,31 +190,26 @@ public class MainHook implements IXposedHookLoadPackage {
             }
             if (getData == null) { log("找不到 getData"); return 0; }
             getData.setAccessible(true);
-            Object rl0h = getData.invoke(lcResp); // rl0.h
-            if (rl0h == null) { log("rl0.h 为 null"); return 0; }
+            Object rl0h = getData.invoke(lcResp);
+            if (rl0h == null) { log("rl0.h null"); return 0; }
 
-            List list = (List) XposedHelpers.callMethod(rl0h, "b"); // ArrayList
-            if (list == null || list.isEmpty()) {
-                log("搜索结果为空");
-                return 0;
-            }
-            Object firstUser = list.get(0);
-            int realUid = XposedHelpers.getIntField(firstUser, "T");
-            log("反查结果: userid=" + realUid);
+            List list = (List) XposedHelpers.callMethod(rl0h, "b");
+            if (list == null || list.isEmpty()) { log("结果为空"); return 0; }
+
+            int realUid = getUid(list.get(0));
+            log("反查结果 userid=" + realUid);
             return realUid;
 
         } catch (Throwable t) {
-            log("resolveUid FAIL: " + t + "\n"
-                    + "  cause: " + t.getCause() + "\n"
-                    + "  msg:   " + t.getMessage());
+            log("resolveUid FAIL: " + t);
             for (StackTraceElement e : t.getStackTrace()) {
-                log("    at " + e);
+                log("  at " + e);
             }
             return 0;
         }
     }
 
-    private static void log(String msg) {
+    static void log(String msg) {
         XposedBridge.log("[HT] " + msg);
     }
 }
