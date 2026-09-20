@@ -9,6 +9,9 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage.LoadPackageParam;
 
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
@@ -17,229 +20,605 @@ public class MainHook implements IXposedHookLoadPackage {
     private static ClassLoader sCl;
     private static volatile boolean resolving = false;
 
+    /*
+     * vq.a.d() 本身没有 URL 参数。
+     * vq.a.intercept() 和 d() 通常在同一线程执行，
+     * 用 ThreadLocal 把当前 URL 关联起来。
+     */
+    private static final ThreadLocal<String> CURRENT_URL =
+            new ThreadLocal<>();
+
     @Override
     public void handleLoadPackage(final LoadPackageParam lpparam) {
-        if (!"com.hellotalk".equals(lpparam.packageName)) return;
+        if (!"com.hellotalk".equals(lpparam.packageName)) {
+            return;
+        }
+
         sCl = lpparam.classLoader;
 
         hookVip();
         hookTranslate();
-        hookHeaderLog();
-        hookFinalHeader();
+
+        // 真正的加密/解密诊断
+        hookSecretData();
+        hookVqInterceptor();
+        hookVqDecrypt();
+
+        // 只观察对象，不拦截跳转、不写回 userid
         hookItem();
+
+        log("=== HT diagnostic module loaded ===");
     }
+
+    // ------------------------------------------------------------------------
+    // 假 VIP
+    // ------------------------------------------------------------------------
 
     private void hookVip() {
         try {
-            XposedHelpers.findAndHookMethod("xt.h", sCl, "j",
-                    XC_MethodReplacement.returnConstant(100));
+            XposedHelpers.findAndHookMethod(
+                    "xt.h",
+                    sCl,
+                    "j",
+                    XC_MethodReplacement.returnConstant(100)
+            );
             log("假VIP OK");
-        } catch (Throwable t) { log("假VIP FAIL: " + t); }
-    }
-
-    private void hookTranslate() {
-        try {
-            XposedHelpers.findAndHookMethod("lx.o", sCl, "h",
-                    XC_MethodReplacement.returnConstant(true));
-            log("翻译 OK");
-        } catch (Throwable t) { log("翻译 FAIL: " + t); }
-    }
-
-    private void hookHeaderLog() {
-        try {
-            Class<?> zh0a = XposedHelpers.findClass("zh0.a", sCl);
-            Class<?> chainCls = XposedHelpers.findClass("okhttp3.Interceptor$Chain", sCl);
-            XposedHelpers.findAndHookMethod(zh0a, "intercept", chainCls,
-                    new XC_MethodHook() {
-                        @Override
-                        protected void beforeHookedMethod(MethodHookParam param) {
-                            dumpReq("zh0.a(加头前)", param);
-                        }
-                    });
-            log("HeaderLog hook OK");
         } catch (Throwable t) {
-            log("HeaderLog hook FAIL: " + t);
+            log("假VIP FAIL: " + t);
         }
     }
 
-    private void hookFinalHeader() {
-        Class<?> chainCls;
-        try { chainCls = XposedHelpers.findClass("okhttp3.Interceptor$Chain", sCl); }
-        catch (Throwable t) { log("找不到 Chain: " + t); return; }
+    // ------------------------------------------------------------------------
+    // 无限翻译
+    // ------------------------------------------------------------------------
 
+    private void hookTranslate() {
         try {
-            Class<?> ai0c = XposedHelpers.findClass("ai0.c", sCl);
-            XposedHelpers.findAndHookMethod(ai0c, "intercept", chainCls,
+            XposedHelpers.findAndHookMethod(
+                    "lx.o",
+                    sCl,
+                    "h",
+                    XC_MethodReplacement.returnConstant(true)
+            );
+            log("翻译 OK");
+        } catch (Throwable t) {
+            log("翻译 FAIL: " + t);
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // SecretDataModel：只打印长度和哈希，不打印密钥原文
+    // ------------------------------------------------------------------------
+
+    private void hookSecretData() {
+        try {
+            Class<?> companion = XposedHelpers.findClass(
+                    "com.hellotalk.ht.base.configure.entity.SecretDataModel$Companion",
+                    sCl
+            );
+
+            hookSecretMethod(companion, "readPub");
+            hookSecretMethod(companion, "readPublicKey");
+            hookSecretMethod(companion, "readSharedSecret");
+
+            log("SecretData hook OK");
+        } catch (Throwable t) {
+            log("SecretData hook FAIL: " + t);
+        }
+    }
+
+    private void hookSecretMethod(Class<?> cls, final String methodName) {
+        XposedHelpers.findAndHookMethod(
+                cls,
+                methodName,
                 new XC_MethodHook() {
-                    @Override
-                    protected void beforeHookedMethod(MethodHookParam param) { dumpReq("ai0.c", param); }
                     @Override
                     protected void afterHookedMethod(MethodHookParam param) {
                         try {
-                            if (!isUniversal(param)) return;
-                            Object resp = param.getResult();
-                            if (resp != null) {
-                                Object code = XposedHelpers.callMethod(resp, "code");
-                                log("[ai0.c] response code=" + code);
-                            }
-                        } catch (Throwable t) {}
+                            Object result = param.getResult();
+                            String value = result == null
+                                    ? ""
+                                    : String.valueOf(result);
+
+                            log("[Secret] " + methodName
+                                    + " len=" + value.length()
+                                    + " sha256=" + sha256(value));
+                        } catch (Throwable t) {
+                            log("[Secret] " + methodName
+                                    + " log failed: " + t);
+                        }
                     }
-                });
-            log("ai0.c hook OK");
-        } catch (Throwable t) { log("ai0.c hook FAIL: " + t); }
-
-        try {
-            Class<?> zh0b = XposedHelpers.findClass("zh0.b", sCl);
-            XposedHelpers.findAndHookMethod(zh0b, "intercept", chainCls,
-                new XC_MethodHook() {
-                    @Override
-                    protected void beforeHookedMethod(MethodHookParam param) { dumpReq("zh0.b", param); }
-                });
-            log("zh0.b hook OK");
-        } catch (Throwable t) { log("zh0.b hook FAIL: " + t); }
+                }
+        );
     }
 
-    private static void dumpReq(String tag, XC_MethodHook.MethodHookParam param) {
+    // ------------------------------------------------------------------------
+    // vq.a：真实 network interceptor
+    // ------------------------------------------------------------------------
+
+    private void hookVqInterceptor() {
         try {
-            Object chain = param.args[0];
-            Object request = XposedHelpers.callMethod(chain, "request");
-            Object url = XposedHelpers.callMethod(request, "url");
-            String urlStr = url.toString();
-            if (!urlStr.contains("/go_user_search/v2/universal")) return;
-            Object headers = XposedHelpers.callMethod(request, "headers");
-            log("=== [" + tag + "] universal 请求 ===\nURL: " + urlStr + "\nHeaders:\n" + headers.toString() + "\n=== END ===");
-        } catch (Throwable t) {}
+            Class<?> vqa = XposedHelpers.findClass("vq.a", sCl);
+            Class<?> chain = XposedHelpers.findClass(
+                    "okhttp3.Interceptor$Chain",
+                    sCl
+            );
+
+            XposedHelpers.findAndHookMethod(
+                    vqa,
+                    "intercept",
+                    chain,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            try {
+                                Object chainObj = param.args[0];
+                                Object request = XposedHelpers.callMethod(
+                                        chainObj,
+                                        "request"
+                                );
+
+                                Object url = XposedHelpers.callMethod(
+                                        request,
+                                        "url"
+                                );
+
+                                String urlString = String.valueOf(url);
+
+                                if (!urlString.contains(
+                                        "/go_user_search/v2/universal"
+                                )) {
+                                    return;
+                                }
+
+                                CURRENT_URL.set(urlString);
+
+                                Object contentType =
+                                        XposedHelpers.callMethod(
+                                                request,
+                                                "header",
+                                                "ht-content-type"
+                                        );
+
+                                Object pub =
+                                        XposedHelpers.callMethod(
+                                                request,
+                                                "header",
+                                                "x-ht-pub"
+                                        );
+
+                                Object body =
+                                        XposedHelpers.callMethod(
+                                                request,
+                                                "body"
+                                        );
+
+                                log("[vq.a request]"
+                                        + "\nurl=" + urlString
+                                        + "\nht-content-type=" + contentType
+                                        + "\nx-ht-pub="
+                                        + summarizeString(pub)
+                                        + "\nbody="
+                                        + summarizeRequestBody(body));
+
+                            } catch (Throwable t) {
+                                log("[vq.a request] error: " + t);
+                            }
+                        }
+
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            try {
+                                if (CURRENT_URL.get() != null) {
+                                    log("[vq.a response] url="
+                                            + CURRENT_URL.get());
+                                }
+                            } catch (Throwable t) {
+                                log("[vq.a response] error: " + t);
+                            } finally {
+                                CURRENT_URL.remove();
+                            }
+                        }
+                    }
+            );
+
+            log("vq.a intercept hook OK");
+        } catch (Throwable t) {
+            log("vq.a intercept hook FAIL: " + t);
+        }
     }
 
-    private static boolean isUniversal(XC_MethodHook.MethodHookParam param) {
+    // ------------------------------------------------------------------------
+    // vq.a.d：真实响应解密函数
+    // d([B, String contentType, String encoding) -> [B
+    // ------------------------------------------------------------------------
+
+    private void hookVqDecrypt() {
         try {
-            Object chain = param.args[0];
-            Object request = XposedHelpers.callMethod(chain, "request");
-            Object url = XposedHelpers.callMethod(request, "url");
-            return url.toString().contains("/go_user_search/v2/universal");
-        } catch (Throwable t) { return false; }
+            Class<?> vqa = XposedHelpers.findClass("vq.a", sCl);
+
+            XposedHelpers.findAndHookMethod(
+                    vqa,
+                    "d",
+                    byte[].class,
+                    String.class,
+                    String.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            try {
+                                byte[] raw = (byte[]) param.args[0];
+                                String contentType =
+                                        String.valueOf(param.args[1]);
+                                String encoding =
+                                        String.valueOf(param.args[2]);
+
+                                if (!isUniversalThread()) {
+                                    return;
+                                }
+
+                                log("[vq.a decrypt input]"
+                                        + "\nurl=" + CURRENT_URL.get()
+                                        + "\ncontentType=" + contentType
+                                        + "\nencoding=" + encoding
+                                        + "\nrawLen="
+                                        + (raw == null ? -1 : raw.length)
+                                        + "\nrawSha256="
+                                        + sha256(raw));
+                            } catch (Throwable t) {
+                                log("[vq.a decrypt input] error: " + t);
+                            }
+                        }
+
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            try {
+                                if (!isUniversalThread()) {
+                                    return;
+                                }
+
+                                byte[] plain = (byte[]) param.getResult();
+
+                                log("[vq.a decrypt output]"
+                                        + "\nurl=" + CURRENT_URL.get()
+                                        + "\nplainLen="
+                                        + (plain == null ? -1 : plain.length)
+                                        + "\nplainSha256="
+                                        + sha256(plain)
+                                        + "\nplainPreview="
+                                        + previewBytes(plain, 5000));
+
+                            } catch (Throwable t) {
+                                log("[vq.a decrypt output] error: " + t);
+                            }
+                        }
+                    }
+            );
+
+            log("vq.a decrypt hook OK");
+        } catch (Throwable t) {
+            log("vq.a decrypt hook FAIL: " + t);
+        }
     }
+
+    private static boolean isUniversalThread() {
+        String url = CURRENT_URL.get();
+        return url != null
+                && url.contains("/go_user_search/v2/universal");
+    }
+
+    // ------------------------------------------------------------------------
+    // rl0.e：只打印 userid，不反查、不拦截、不写回
+    // ------------------------------------------------------------------------
 
     private void hookItem() {
         try {
-            XposedHelpers.findAndHookMethod("rl0.e", sCl, "T",
+            XposedHelpers.findAndHookMethod(
+                    "rl0.e",
+                    sCl,
+                    "T",
                     new XC_MethodHook() {
                         @Override
                         protected void afterHookedMethod(MethodHookParam param) {
                             try {
                                 Object item = param.thisObject;
-                                Object uidObj = param.getResult();
-                                int uid = (uidObj == null) ? 0 : ((Integer) uidObj);
-                                Object y = XposedHelpers.getObjectField(item, "Y");
-                                String uname = (y == null) ? null : y.toString();
+                                Object uidObject = param.getResult();
 
-                                log("item userid=" + uid + ", username=" + uname);
+                                int uid = uidObject == null
+                                        ? 0
+                                        : ((Integer) uidObject);
 
-                                if (uid == 0 && uname != null && !uname.isEmpty() && !resolving) {
-                                    resolving = true;
-                                    log(">>> 触发反查(慢速) username=" + uname);
-                                    final String nick = uname;
-                                    new Thread(() -> {
-                                        try { resolveUidByUsername(nick); }
-                                        finally { resolving = false; }
-                                    }).start();
-                                }
-                            } catch (Throwable t) {}
+                                Object username =
+                                        XposedHelpers.getObjectField(item, "Y");
+
+                                log("[item]"
+                                        + " userid=" + uid
+                                        + " username=" + username);
+                            } catch (Throwable t) {
+                                log("[item] error: " + t);
+                            }
                         }
-                    });
+                    }
+            );
+
             log("Item hook OK");
-        } catch (Throwable t) { log("Item hook FAIL: " + t); }
-    }
-
-    static int resolveUidByUsername(String username) {
-        if (username == null || username.isEmpty()) return 0;
-        String nick = username.startsWith("@") ? username.substring(1) : username;
-        log("反查传入 nickname=[" + nick + "] len=" + nick.length());
-        try {
-            // ★ 先等 3 秒，模拟人工节奏
-            Thread.sleep(3000);
-            long t0 = System.currentTimeMillis();
-
-            Class<?> ql0c = XposedHelpers.findClass("ql0.c", sCl);
-            Class<?> m41f0 = XposedHelpers.findClass("m41.f0", sCl);
-            Class<?> qh0a = XposedHelpers.findClass("qh0.a", sCl);
-
-            Object wrapped = XposedHelpers.callStaticMethod(m41f0, "b", ql0c);
-            Object api = XposedHelpers.callStaticMethod(qh0a, "a", wrapped);
-            log("反查 API 获取耗时=" + (System.currentTimeMillis() - t0) + "ms");
-
-            Class<?> d41d = XposedHelpers.findClass("d41.d", sCl);
-            Method gMethod = null;
-            for (Method m : ql0c.getDeclaredMethods()) {
-                if ("g".equals(m.getName()) && m.getParameterCount() == 4
-                        && m.getParameterTypes()[0] == int.class) {
-                    gMethod = m; break;
-                }
-            }
-            if (gMethod == null) { log("找不到 g 方法"); return 0; }
-            gMethod.setAccessible(true);
-
-            final Object emptyContext = getEmptyCoroutineContext();
-            final CountDownLatch latch = new CountDownLatch(1);
-            final Object[] holder = new Object[1];
-
-            Object continuation = Proxy.newProxyInstance(sCl,
-                    new Class[]{ d41d },
-                    (proxy, method, args) -> {
-                        if ("resumeWith".equals(method.getName())) {
-                            holder[0] = args[0]; latch.countDown(); return null;
-                        }
-                        if ("getContext".equals(method.getName())) return emptyContext;
-                        return null;
-                    });
-
-            gMethod.invoke(api, 1, 15, nick, continuation);
-
-            if (!latch.await(15, TimeUnit.SECONDS)) { log("反查超时"); return 0; }
-            log("反查总耗时=" + (System.currentTimeMillis() - t0) + "ms");
-
-            Object result = holder[0];
-            if (result == null) { log("result null"); return 0; }
-
-            Object lcResp = XposedHelpers.getObjectField(result, "b");
-            Object code = XposedHelpers.callMethod(lcResp, "getCode");
-            Object data = XposedHelpers.callMethod(lcResp, "getData");
-            log("universal code=" + code + " data=" + data);
-            if (data == null) { log("data null"); return 0; }
-
-            java.util.List list = (java.util.List) XposedHelpers.callMethod(data, "b");
-            if (list == null || list.isEmpty()) { log("列表空"); return 0; }
-
-            int realUid = 0;
-            for (Object it : list) {
-                Object uid = XposedHelpers.getObjectField(it, "T");
-                Object uy = XposedHelpers.getObjectField(it, "Y");
-                log("  候选: userid=" + uid + " username=" + uy);
-                int v = (uid == null) ? 0 : ((Integer) uid);
-                if (v != 0) { realUid = v; break; }
-            }
-            log("反查最终 realUid=" + realUid);
-            return realUid;
-
         } catch (Throwable t) {
-            log("resolveUid FAIL: " + t);
-            Throwable real = t;
-            while (real instanceof java.lang.reflect.InvocationTargetException
-                    && real.getCause() != null) real = real.getCause();
-            log("  ★真正原因: " + real);
-            return 0;
+            log("Item hook FAIL: " + t);
         }
     }
 
-    static Object getEmptyCoroutineContext() {
+    // ------------------------------------------------------------------------
+    // 保留旧的反查诊断，但默认不自动触发
+    // 这版先不自动反查，避免测试时制造额外变量。
+    // ------------------------------------------------------------------------
+
+    static int resolveUidByUsername(String username) {
+        if (username == null || username.isEmpty()) {
+            return 0;
+        }
+
+        String nickname = username.startsWith("@")
+                ? username.substring(1)
+                : username;
+
+        log("[manual resolve] nickname=" + nickname);
+
         try {
-            Class<?> e = XposedHelpers.findClass("d41.g", sCl);
-            return XposedHelpers.getStaticObjectField(e, "n");
+            Class<?> apiClass = XposedHelpers.findClass(
+                    "ql0.c",
+                    sCl
+            );
+
+            Class<?> factory = XposedHelpers.findClass(
+                    "m41.f0",
+                    sCl
+            );
+
+            Class<?> serviceFactory = XposedHelpers.findClass(
+                    "qh0.a",
+                    sCl
+            );
+
+            Object wrapper = XposedHelpers.callStaticMethod(
+                    factory,
+                    "b",
+                    apiClass
+            );
+
+            Object api = XposedHelpers.callStaticMethod(
+                    serviceFactory,
+                    "a",
+                    wrapper
+            );
+
+            Class<?> continuationClass = XposedHelpers.findClass(
+                    "d41.d",
+                    sCl
+            );
+
+            Method universal = null;
+
+            for (Method method : apiClass.getDeclaredMethods()) {
+                if ("g".equals(method.getName())
+                        && method.getParameterTypes().length == 4
+                        && method.getParameterTypes()[0] == int.class) {
+                    universal = method;
+                    break;
+                }
+            }
+
+            if (universal == null) {
+                log("[manual resolve] g not found");
+                return 0;
+            }
+
+            universal.setAccessible(true);
+
+            final CountDownLatch latch = new CountDownLatch(1);
+            final Object[] holder = new Object[1];
+
+            Object context = getEmptyCoroutineContext();
+
+            Object continuation = Proxy.newProxyInstance(
+                    sCl,
+                    new Class[]{continuationClass},
+                    (proxy, method, args) -> {
+                        if ("resumeWith".equals(method.getName())) {
+                            holder[0] = args == null
+                                    ? null
+                                    : args[0];
+                            latch.countDown();
+                            return null;
+                        }
+
+                        if ("getContext".equals(method.getName())) {
+                            return context;
+                        }
+
+                        return null;
+                    }
+            );
+
+            universal.invoke(
+                    api,
+                    1,
+                    15,
+                    nickname,
+                    continuation
+            );
+
+            if (!latch.await(15, TimeUnit.SECONDS)) {
+                log("[manual resolve] timeout");
+                return 0;
+            }
+
+            Object result = holder[0];
+
+            if (result == null) {
+                log("[manual resolve] null result");
+                return 0;
+            }
+
+            Object lcResponse =
+                    XposedHelpers.getObjectField(result, "b");
+
+            Object code =
+                    XposedHelpers.callMethod(lcResponse, "getCode");
+
+            Object data =
+                    XposedHelpers.callMethod(lcResponse, "getData");
+
+            log("[manual resolve] code=" + code
+                    + " data=" + data);
+
+            if (data == null) {
+                return 0;
+            }
+
+            List<?> list = (List<?>) XposedHelpers.callMethod(
+                    data,
+                    "b"
+            );
+
+            if (list == null) {
+                return 0;
+            }
+
+            for (Object item : list) {
+                Object uid =
+                        XposedHelpers.getObjectField(item, "T");
+
+                Object name =
+                        XposedHelpers.getObjectField(item, "Y");
+
+                log("[manual resolve candidate]"
+                        + " userid=" + uid
+                        + " username=" + name);
+
+                if (uid instanceof Integer
+                        && ((Integer) uid) != 0) {
+                    return (Integer) uid;
+                }
+            }
+
         } catch (Throwable t) {
-            log("getEmptyCoroutineContext 失败: " + t);
+            log("[manual resolve] failed: " + t);
+        }
+
+        return 0;
+    }
+
+    private static Object getEmptyCoroutineContext() {
+        try {
+            Class<?> contextClass =
+                    XposedHelpers.findClass("d41.g", sCl);
+
+            return XposedHelpers.getStaticObjectField(
+                    contextClass,
+                    "n"
+            );
+        } catch (Throwable t) {
+            log("EmptyCoroutineContext error: " + t);
             return null;
         }
     }
 
-    static void log(String msg) { XposedBridge.log("[HT] " + msg); }
+    // ------------------------------------------------------------------------
+    // 工具函数
+    // ------------------------------------------------------------------------
+
+    private static String summarizeString(Object value) {
+        if (value == null) {
+            return "null";
+        }
+
+        String text = String.valueOf(value);
+
+        return "len=" + text.length()
+                + ", sha256=" + sha256(text)
+                + ", prefix="
+                + (text.length() <= 24
+                ? text
+                : text.substring(0, 24) + "...");
+    }
+
+    private static String summarizeRequestBody(Object body) {
+        if (body == null) {
+            return "null";
+        }
+
+        try {
+            Object contentType =
+                    XposedHelpers.callMethod(body, "contentType");
+
+            Object length =
+                    XposedHelpers.callMethod(body, "contentLength");
+
+            return "contentType=" + contentType
+                    + ", length=" + length;
+        } catch (Throwable t) {
+            return "body=" + body.getClass().getName();
+        }
+    }
+
+    private static String previewBytes(byte[] bytes, int maxChars) {
+        if (bytes == null) {
+            return "null";
+        }
+
+        try {
+            String text = new String(
+                    bytes,
+                    StandardCharsets.UTF_8
+            );
+
+            if (text.length() > maxChars) {
+                return text.substring(0, maxChars) + "...";
+            }
+
+            return text;
+        } catch (Throwable t) {
+            return "<not utf8>";
+        }
+    }
+
+    private static String sha256(String value) {
+        if (value == null) {
+            return "null";
+        }
+
+        try {
+            return sha256(
+                    value.getBytes(StandardCharsets.UTF_8)
+            );
+        } catch (Throwable t) {
+            return "error";
+        }
+    }
+
+    private static String sha256(byte[] bytes) {
+        if (bytes == null) {
+            return "null";
+        }
+
+        try {
+            MessageDigest digest =
+                    MessageDigest.getInstance("SHA-256");
+
+            byte[] result = digest.digest(bytes);
+            StringBuilder builder = new StringBuilder();
+
+            for (byte b : result) {
+                builder.append(String.format("%02x", b));
+            }
+
+            return builder.toString();
+        } catch (Throwable t) {
+            return "error";
+        }
+    }
+
+    private static void log(String message) {
+        XposedBridge.log("[HT] " + message);
+    }
 }
