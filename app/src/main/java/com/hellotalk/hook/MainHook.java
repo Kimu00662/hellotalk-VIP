@@ -151,6 +151,9 @@ public class MainHook implements IXposedHookLoadPackage {
             if (gMethod == null) { log("找不到 g 方法"); return 0; }
             gMethod.setAccessible(true);
 
+            // 拿 EmptyCoroutineContext
+            final Object emptyContext = getEmptyCoroutineContext();
+
             final CountDownLatch latch = new CountDownLatch(1);
             final Object[] resultHolder = new Object[1];
 
@@ -160,6 +163,10 @@ public class MainHook implements IXposedHookLoadPackage {
                         if ("resumeWith".equals(method.getName())) {
                             resultHolder[0] = args[0];
                             latch.countDown();
+                            return null;
+                        }
+                        if ("getContext".equals(method.getName())) {
+                            return emptyContext;
                         }
                         return null;
                     });
@@ -212,6 +219,28 @@ public class MainHook implements IXposedHookLoadPackage {
                 log("    at " + e);
             }
             return 0;
+        }
+    }
+
+    // 获取 EmptyCoroutineContext 单例
+    static Object getEmptyCoroutineContext() {
+        try {
+            // kotlin.coroutines.EmptyCoroutineContext.INSTANCE
+            Class<?> e = XposedHelpers.findClass("kotlin.coroutines.EmptyCoroutineContext", sCl);
+            return XposedHelpers.getStaticObjectField(e, "INSTANCE");
+        } catch (Throwable t) {
+            // 万一字段名不同，尝试枚举字段
+            try {
+                Class<?> e = XposedHelpers.findClass("kotlin.coroutines.EmptyCoroutineContext", sCl);
+                for (java.lang.reflect.Field f : e.getDeclaredFields()) {
+                    if (java.lang.reflect.Modifier.isStatic(f.getModifiers())) {
+                        f.setAccessible(true);
+                        return f.get(null);
+                    }
+                }
+            } catch (Throwable t2) {}
+            log("getEmptyCoroutineContext 失败: " + t);
+            return null;
         }
     }
 
