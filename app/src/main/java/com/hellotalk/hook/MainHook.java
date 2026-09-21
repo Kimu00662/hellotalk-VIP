@@ -7,8 +7,15 @@ import android.os.Looper;
 import android.view.View;
 
 import java.lang.ref.WeakReference;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.Date;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.WeakHashMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
@@ -46,11 +53,58 @@ public class MainHook implements IXposedHookLoadPackage {
     private static final Map<String, Integer> UID_CACHE =
             new ConcurrentHashMap<>();
 
+    private static final Map<Activity, MomentSnapshotState> MOMENT_SNAPSHOTS =
+            new WeakHashMap<>();
+
     private static final long TIMEOUT_MS = 20000L;
     private static final long EMPTY_RECHECK_MS = 800L;
+    private static final long SNAPSHOT_START_DELAY_MS = 120L;
+    private static final long SNAPSHOT_PAIR_DELAY_MS = 120L;
+    private static final int SNAPSHOT_MAX_PAIRS = 6;
+    private static final int SNAPSHOT_MAX_USERS = 20;
+    private static final int SNAPSHOT_MAX_MOMENTS = 100;
 
     private interface HookTask {
         void run() throws Throwable;
+    }
+
+    private static final class MomentLanguagePair {
+        final int nativeLanguage;
+        final int learnLanguage;
+
+        MomentLanguagePair(
+                int nativeLanguage,
+                int learnLanguage
+        ) {
+            this.nativeLanguage = nativeLanguage;
+            this.learnLanguage = learnLanguage;
+        }
+    }
+
+    private static final class MomentSnapshotState {
+        final WeakReference<Activity> source;
+        final ArrayList<MomentLanguagePair> pairs;
+        final Set<Integer> userIds =
+                new LinkedHashSet<>();
+        WeakReference<Activity> helper =
+                new WeakReference<>(null);
+        int pairIndex;
+        int activePairNumber = -1;
+        volatile boolean pairCaptured;
+        volatile boolean running;
+        volatile boolean cancelled;
+        boolean pairRetryScheduled;
+        int pairEmptyRetryCount;
+        boolean fetchStarted;
+        long generation;
+
+        MomentSnapshotState(
+                Activity source,
+                ArrayList<MomentLanguagePair> pairs
+        ) {
+            this.source = new WeakReference<>(source);
+            this.pairs = pairs;
+        }
     }
 
     @Override
@@ -106,6 +160,27 @@ public class MainHook implements IXposedHookLoadPackage {
             @Override
             public void run() throws Throwable {
                 hookMomentHistoryCondition();
+            }
+        });
+
+        safe(new HookTask() {
+            @Override
+            public void run() throws Throwable {
+                hookMomentSnapshotActivity();
+            }
+        });
+
+        safe(new HookTask() {
+            @Override
+            public void run() throws Throwable {
+                hookMomentSnapshotUserActivity();
+            }
+        });
+
+        safe(new HookTask() {
+            @Override
+            public void run() throws Throwable {
+                hookMomentSnapshotUserPaging();
             }
         });
 
@@ -494,6 +569,1199 @@ public class MainHook implements IXposedHookLoadPackage {
                     : -1;
         } catch (Throwable ignored) {
             return -1;
+        }
+    }
+
+    // ============================================================
+    // 自定义动态快照
+    // ============================================================
+
+    private static void hookMomentSnapshotActivity()
+            throws Throwable {
+        final Class<?> activityClass =
+                XposedHelpers.findClass(
+                        "com.hellotalk.moment.search.ui.MomentSearchResultActivity",
+                        sCl
+                );
+
+        XposedHelpers.findAndHookMethod(
+                activityClass,
+                "initData",
+                new XC_MethodHook() {
+                    @Override
+                    protected void beforeHookedMethod(
+                            MethodHookParam param
+                    ) {
+                        try {
+                            Activity activity =
+                                    (Activity) param.thisObject;
+
+                            ArrayList<MomentLanguagePair> pairs =
+                                    getCustomMomentPairs(activity);
+
+                            if (pairs == null) {
+                                return;
+                            }
+
+                            XposedHelpers.callMethod(
+                                    activity,
+                                    "y4"
+                            );
+                            startMomentSnapshot(
+                                    activity,
+                                    pairs,
+                                    false
+                            );
+                            param.setResult(null);
+                        } catch (Throwable t) {
+                            log("[MOMENT_SNAPSHOT] init failed: "
+                                    + t.getClass().getName());
+                        }
+                    }
+                }
+        );
+
+        XposedHelpers.findAndHookMethod(
+                activityClass,
+                "onRefresh",
+                new XC_MethodHook() {
+                    @Override
+                    protected void beforeHookedMethod(
+                            MethodHookParam param
+                    ) {
+                        try {
+                            Activity activity =
+                                    (Activity) param.thisObject;
+
+                            MomentSnapshotState state =
+                                    getMomentSnapshot(activity);
+
+                            ArrayList<MomentLanguagePair> pairs =
+                                    getCustomMomentPairs(activity);
+
+                            if (pairs == null) {
+                                return;
+                            }
+
+                            startMomentSnapshot(
+                                    activity,
+                                    pairs,
+                                    true
+                            );
+                            param.setResult(null);
+                        } catch (Throwable t) {
+                            log("[MOMENT_SNAPSHOT] refresh failed: "
+                                    + t.getClass().getName());
+                        }
+                    }
+                }
+        );
+
+        XposedHelpers.findAndHookMethod(
+                activityClass,
+                "onDestroy",
+                new XC_MethodHook() {
+                    @Override
+                    protected void afterHookedMethod(
+                            MethodHookParam param
+                    ) {
+                        try {
+                            Activity activity =
+                                    (Activity) param.thisObject;
+                            MomentSnapshotState state =
+                                    removeMomentSnapshot(activity);
+                            if (state != null) {
+                                state.running = false;
+                                state.cancelled = true;
+                                finishActivity(
+                                        state.helper.get()
+                                );
+                            }
+                        } catch (Throwable ignored) {
+                        }
+                    }
+                }
+        );
+
+        log("Moment snapshot activity hook OK");
+    }
+
+    private static void hookMomentSnapshotUserActivity()
+            throws Throwable {
+        final Class<?> activityClass =
+                XposedHelpers.findClass(
+                        "com.hellotalk.search.v2.logic.controller.searchuser.UserSearchActivity",
+                        sCl
+                );
+
+        XposedHelpers.findAndHookMethod(
+                activityClass,
+                "init",
+                new XC_MethodHook() {
+                    @Override
+                    protected void afterHookedMethod(
+                            MethodHookParam param
+                    ) {
+                        try {
+                            Activity activity =
+                                    (Activity) param.thisObject;
+                            long generation =
+                                    activity.getIntent().getLongExtra(
+                                            "ht_moment_snapshot_generation",
+                                            0L
+                                    );
+                            MomentSnapshotState state =
+                                    findMomentSnapshot(generation);
+                            if (state == null || !state.running) {
+                                return;
+                            }
+
+                            state.helper =
+                                    new WeakReference<>(activity);
+                            hideMomentSnapshotHelper(activity);
+                        } catch (Throwable t) {
+                            log("[MOMENT_SNAPSHOT] helper init failed: "
+                                    + t.getClass().getName());
+                        }
+                    }
+                }
+        );
+
+        log("Moment snapshot user activity hook OK");
+    }
+
+    private static void hookMomentSnapshotUserPaging()
+            throws Throwable {
+        final Class<?> fragmentClass =
+                XposedHelpers.findClass(
+                        "com.hellotalk.search.v2.logic.controller.searchuser.BaseUserPagingFragment",
+                        sCl
+                );
+
+        final Class<?> loadStates =
+                XposedHelpers.findClass(
+                        "f4.h",
+                        sCl
+                );
+
+        XposedHelpers.findAndHookMethod(
+                fragmentClass,
+                "onRefreshLoadState",
+                loadStates,
+                new XC_MethodHook() {
+                    @Override
+                    protected void afterHookedMethod(
+                            MethodHookParam param
+                    ) {
+                        try {
+                            Object fragment =
+                                    param.thisObject;
+
+                            if (!isMomentSnapshotUserFragment(
+                                    fragment
+                            )) {
+                                return;
+                            }
+
+                            Object activityObject =
+                                    XposedHelpers.callMethod(
+                                            fragment,
+                                            "getActivity"
+                                    );
+
+                            if (!(activityObject instanceof Activity)) {
+                                return;
+                            }
+
+                            Activity helperActivity =
+                                    (Activity) activityObject;
+                            MomentSnapshotState state =
+                                    findMomentSnapshot(
+                                            helperActivity
+                                    );
+                            if (state == null) {
+                                long generation =
+                                        helperActivity.getIntent()
+                                                .getLongExtra(
+                                                        "ht_moment_snapshot_generation",
+                                                        0L
+                                                );
+                                state =
+                                        findMomentSnapshot(
+                                                generation
+                                        );
+                                if (state != null) {
+                                    state.helper =
+                                            new WeakReference<>(
+                                                    helperActivity
+                                            );
+                                }
+                            }
+
+                            if (state == null || state.cancelled) {
+                                return;
+                            }
+
+                            int helperPair =
+                                    helperActivity.getIntent()
+                                            .getIntExtra(
+                                                    "ht_moment_snapshot_pair",
+                                                    -1
+                                            );
+                            synchronized (state) {
+                                if (helperPair
+                                        != state.activePairNumber) {
+                                    return;
+                                }
+                            }
+
+                            Object loadState =
+                                    XposedHelpers.callMethod(
+                                            param.args[0],
+                                            "b"
+                                    );
+
+                            if (loadState == null) {
+                                return;
+                            }
+
+                            String stateClass =
+                                    loadState.getClass().getName();
+
+                            if ("f4.w$a".equals(stateClass)) {
+                                completeMomentSnapshotPair(state);
+                                return;
+                            }
+
+                            if (!"f4.w$c".equals(stateClass)) {
+                                return;
+                            }
+
+                            final int pairNumber;
+                            synchronized (state) {
+                                pairNumber = state.activePairNumber;
+                            }
+                            collectMomentSnapshotUsers(
+                                    fragment,
+                                    state,
+                                    pairNumber
+                            );
+                        } catch (Throwable t) {
+                            log("[MOMENT_SNAPSHOT] user paging failed: "
+                                    + t.getClass().getName());
+                        }
+                    }
+                }
+        );
+
+        log("Moment snapshot user paging hook OK");
+    }
+
+    private static ArrayList<MomentLanguagePair> getCustomMomentPairs(
+            Activity activity
+    ) {
+        try {
+            ArrayList<Integer> targetTeachLanguages =
+                    copyIntegerList(
+                            XposedHelpers.getObjectField(
+                                    activity,
+                                    "x"
+                            )
+                    );
+            ArrayList<Integer> targetLearnLanguages =
+                    copyIntegerList(
+                            XposedHelpers.getObjectField(
+                                    activity,
+                                    "y"
+                            )
+                    );
+
+            if (targetTeachLanguages.isEmpty()
+                    || targetLearnLanguages.isEmpty()) {
+                return null;
+            }
+
+            Object userLanguage = currentUserLanguage();
+            if (userLanguage == null) {
+                return null;
+            }
+
+            ArrayList<Integer> defaultTeach =
+                    copyIntegerList(
+                            XposedHelpers.callMethod(
+                                    userLanguage,
+                                    "getLearnLanguageList"
+                            )
+                    );
+            ArrayList<Integer> defaultLearn =
+                    copyIntegerList(
+                            XposedHelpers.callMethod(
+                                    userLanguage,
+                                    "getTeachLanguageList"
+                            )
+                    );
+
+            if (sameIntegerLists(
+                    targetTeachLanguages,
+                    defaultTeach
+            ) && sameIntegerLists(
+                    targetLearnLanguages,
+                    defaultLearn
+            )) {
+                return null;
+            }
+
+            ArrayList<MomentLanguagePair> pairs =
+                    new ArrayList<>();
+
+            for (Integer targetLearnLanguage
+                    : targetLearnLanguages) {
+                for (Integer targetTeachLanguage
+                        : targetTeachLanguages) {
+                    if (targetLearnLanguage == null
+                            || targetTeachLanguage == null
+                            || targetLearnLanguage <= 0
+                            || targetTeachLanguage <= 0
+                            || targetLearnLanguage.equals(
+                            targetTeachLanguage
+                    )) {
+                        continue;
+                    }
+
+                    pairs.add(
+                            new MomentLanguagePair(
+                                    targetTeachLanguage,
+                                    targetLearnLanguage
+                            )
+                    );
+
+                    if (pairs.size() >= SNAPSHOT_MAX_PAIRS) {
+                        return pairs;
+                    }
+                }
+            }
+
+            return pairs.isEmpty() ? null : pairs;
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    private static Object currentUserLanguage() {
+        try {
+            Class<?> userManagerClass =
+                    XposedHelpers.findClass(
+                            "xt.l",
+                            sCl
+                    );
+            Object userManager =
+                    XposedHelpers.callStaticMethod(
+                            userManagerClass,
+                            "r"
+                    );
+
+            Class<?> accountClass =
+                    XposedHelpers.findClass(
+                            "et.b",
+                            sCl
+                    );
+            Object account =
+                    XposedHelpers.callStaticMethod(
+                            accountClass,
+                            "e"
+                    );
+            int uid =
+                    XposedHelpers.getIntField(
+                            account,
+                            "b"
+                    );
+
+            Object user =
+                    XposedHelpers.callMethod(
+                            userManager,
+                            "s",
+                            uid
+                    );
+            if (user == null) {
+                return null;
+            }
+
+            Class<?> userUtilsClass =
+                    XposedHelpers.findClass(
+                            "xt.s",
+                            sCl
+                    );
+            return XposedHelpers.callStaticMethod(
+                    userUtilsClass,
+                    "k",
+                    user
+            );
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private static ArrayList<Integer> copyIntegerList(
+            Object value
+    ) {
+        ArrayList<Integer> result =
+                new ArrayList<>();
+
+        if (!(value instanceof List)) {
+            return result;
+        }
+
+        for (Object item : (List<?>) value) {
+            if (item instanceof Integer
+                    && ((Integer) item) > 0) {
+                result.add((Integer) item);
+            }
+        }
+
+        return result;
+    }
+
+    private static boolean sameIntegerLists(
+            List<Integer> first,
+            List<Integer> second
+    ) {
+        return first != null
+                && second != null
+                && first.size() == second.size()
+                && first.containsAll(second)
+                && second.containsAll(first);
+    }
+
+    private static void startMomentSnapshot(
+            Activity source,
+            ArrayList<MomentLanguagePair> pairs,
+            boolean force
+    ) {
+        if (source == null || pairs == null || pairs.isEmpty()) {
+            return;
+        }
+
+        MomentSnapshotState previous;
+        MomentSnapshotState state;
+
+        synchronized (MOMENT_SNAPSHOTS) {
+            previous = MOMENT_SNAPSHOTS.get(source);
+
+            if (!force
+                    && previous != null
+                    && previous.running) {
+                return;
+            }
+
+            if (previous != null) {
+                previous.running = false;
+                previous.cancelled = true;
+            }
+
+            state =
+                    new MomentSnapshotState(
+                            source,
+                            pairs
+                    );
+            state.running = true;
+            state.cancelled = false;
+            state.generation =
+                    TOKEN_COUNTER.incrementAndGet();
+            MOMENT_SNAPSHOTS.put(source, state);
+        }
+
+        if (previous != null) {
+            finishActivity(previous.helper.get());
+        }
+
+        final MomentSnapshotState finalState = state;
+        boolean posted =
+                postDelayed(
+                        new Runnable() {
+                            @Override
+                            public void run() {
+                                launchMomentSnapshotPair(
+                                        finalState
+                                );
+                            }
+                        },
+                        SNAPSHOT_START_DELAY_MS
+                );
+
+        if (!posted) {
+            state.running = false;
+        }
+    }
+
+    private static void launchMomentSnapshotPair(
+            final MomentSnapshotState state
+    ) {
+        if (state == null || !state.running) {
+            return;
+        }
+
+        Activity source =
+                state.source.get();
+        if (source == null
+                || source.isFinishing()
+                || isDestroyed(source)) {
+            state.running = false;
+            return;
+        }
+
+        final MomentLanguagePair pair;
+        final int pairNumber;
+
+        synchronized (state) {
+            if (!state.running) {
+                return;
+            }
+
+            if (state.pairIndex >= state.pairs.size()) {
+                fetchMomentSnapshot(state);
+                return;
+            }
+
+            pairNumber = state.pairIndex;
+            pair = state.pairs.get(state.pairIndex++);
+            state.activePairNumber = pairNumber;
+            state.pairCaptured = false;
+            state.pairRetryScheduled = false;
+            state.pairEmptyRetryCount = 0;
+        }
+
+        try {
+            Class<?> activityClass =
+                    XposedHelpers.findClass(
+                            "com.hellotalk.search.v2.logic.controller.searchuser.UserSearchActivity",
+                            sCl
+                    );
+
+            Class<?> filterClass =
+                    XposedHelpers.findClass(
+                            "com.hellotalk.search.eitity.FilterIntentEntity",
+                            sCl
+                    );
+
+            Object filter =
+                    XposedHelpers.newInstance(
+                            filterClass
+                    );
+
+            XposedHelpers.callMethod(
+                    filter,
+                    "setAge",
+                    "1-5"
+            );
+            XposedHelpers.callMethod(
+                    filter,
+                    "setLearnLanguage",
+                    String.valueOf(pair.learnLanguage)
+            );
+            XposedHelpers.callMethod(
+                    filter,
+                    "setNativeLanguage",
+                    String.valueOf(pair.nativeLanguage)
+            );
+            XposedHelpers.callMethod(
+                    filter,
+                    "setLevel",
+                    "1-5"
+            );
+            XposedHelpers.callMethod(
+                    filter,
+                    "setCountry",
+                    "All"
+            );
+            XposedHelpers.callMethod(
+                    filter,
+                    "setCity",
+                    ""
+            );
+            XposedHelpers.callMethod(
+                    filter,
+                    "setGender",
+                    "All"
+            );
+            XposedHelpers.callMethod(
+                    filter,
+                    "setSource",
+                    "moment_snapshot"
+            );
+            XposedHelpers.callMethod(
+                    filter,
+                    "setLongitude",
+                    ""
+            );
+            XposedHelpers.callMethod(
+                    filter,
+                    "setLatitude",
+                    ""
+            );
+            XposedHelpers.callMethod(
+                    filter,
+                    "setNewUser",
+                    false
+            );
+            XposedHelpers.callMethod(
+                    filter,
+                    "setVip",
+                    true
+            );
+
+            Intent intent =
+                    new Intent(
+                            source,
+                            activityClass
+                    );
+            intent.putExtra(
+                    "key_filter_entity",
+                    (java.io.Serializable) filter
+            );
+            intent.putExtra(
+                    "ht_moment_snapshot_generation",
+                    state.generation
+            );
+            intent.putExtra(
+                    "ht_moment_snapshot_pair",
+                    pairNumber
+            );
+
+            source.startActivity(intent);
+            source.overridePendingTransition(
+                    0,
+                    0
+            );
+
+            log("[MOMENT_SNAPSHOT] user search pair="
+                    + (pairNumber + 1));
+
+            postDelayed(
+                    new Runnable() {
+                        @Override
+                        public void run() {
+                            synchronized (state) {
+                                if (!state.running
+                                        || state.pairCaptured
+                                        || state.pairIndex
+                                        != pairNumber + 1) {
+                                    return;
+                                }
+                                state.pairCaptured = true;
+                            }
+
+                            finishActivity(
+                                    state.helper.get()
+                            );
+                            launchMomentSnapshotPair(state);
+                        }
+                    },
+                    10000L
+            );
+        } catch (Throwable t) {
+            log("[MOMENT_SNAPSHOT] launch user search failed: "
+                    + t.getClass().getName());
+            completeMomentSnapshotPair(state);
+        }
+    }
+
+    private static void collectMomentSnapshotUsers(
+            final Object fragment,
+            final MomentSnapshotState state,
+            final int expectedPairNumber
+    ) {
+        synchronized (state) {
+            if (state.pairCaptured
+                    || state.pairRetryScheduled
+                    || state.activePairNumber
+                    != expectedPairNumber) {
+                return;
+            }
+        }
+
+        Object listObject = null;
+        try {
+            Object adapter =
+                    XposedHelpers.getObjectField(
+                            fragment,
+                            "userListAdapter"
+                    );
+            Object snapshot =
+                    adapter == null
+                            ? null
+                            : XposedHelpers.callMethod(
+                            adapter,
+                            "r"
+                    );
+            listObject =
+                    snapshot == null
+                            ? null
+                            : XposedHelpers.callMethod(
+                            snapshot,
+                            "d"
+                    );
+        } catch (Throwable t) {
+            log("[MOMENT_SNAPSHOT] collect users failed: "
+                    + t.getClass().getName());
+        }
+
+        if (!(listObject instanceof List)
+                || ((List<?>) listObject).isEmpty()) {
+            boolean retry;
+            synchronized (state) {
+                retry = state.pairEmptyRetryCount < 2;
+                if (retry) {
+                    state.pairEmptyRetryCount++;
+                    state.pairRetryScheduled = true;
+                } else {
+                    state.pairCaptured = true;
+                }
+            }
+
+            if (retry) {
+                postDelayed(
+                        new Runnable() {
+                            @Override
+                            public void run() {
+                                synchronized (state) {
+                                    state.pairRetryScheduled = false;
+                                }
+                                collectMomentSnapshotUsers(
+                                        fragment,
+                                        state,
+                                        expectedPairNumber
+                                );
+                            }
+                        },
+                        700L
+                );
+                return;
+            }
+        } else {
+            synchronized (state) {
+                state.pairCaptured = true;
+            }
+
+            for (Object item : (List<?>) listObject) {
+                int uid = readUid(item);
+                if (uid <= 0) {
+                    continue;
+                }
+
+                synchronized (state) {
+                    if (state.userIds.size()
+                            >= SNAPSHOT_MAX_USERS) {
+                        break;
+                    }
+                    state.userIds.add(uid);
+                }
+            }
+        }
+
+        finishActivity(state.helper.get());
+        postDelayed(
+                new Runnable() {
+                    @Override
+                    public void run() {
+                        launchMomentSnapshotPair(state);
+                    }
+                },
+                SNAPSHOT_PAIR_DELAY_MS
+        );
+    }
+
+    private static void completeMomentSnapshotPair(
+            MomentSnapshotState state
+    ) {
+        if (state == null) {
+            return;
+        }
+
+        synchronized (state) {
+            if (state.pairCaptured) {
+                return;
+            }
+            state.pairCaptured = true;
+        }
+
+        finishActivity(state.helper.get());
+        postDelayed(
+                new Runnable() {
+                    @Override
+                    public void run() {
+                        launchMomentSnapshotPair(state);
+                    }
+                },
+                SNAPSHOT_PAIR_DELAY_MS
+        );
+    }
+
+    private static boolean isMomentSnapshotUserFragment(
+            Object fragment
+    ) {
+        if (fragment == null
+                || !"com.hellotalk.search.v2.logic.controller.searchuser.UserSearchFragment"
+                .equals(
+                        fragment.getClass().getName()
+                )) {
+            return false;
+        }
+
+        try {
+            Object activity =
+                    XposedHelpers.callMethod(
+                            fragment,
+                            "getActivity"
+                    );
+            return activity != null
+                    && "com.hellotalk.search.v2.logic.controller.searchuser.UserSearchActivity"
+                    .equals(
+                            activity.getClass().getName()
+                    );
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    private static void hideMomentSnapshotHelper(
+            Activity activity
+    ) {
+        try {
+            android.view.Window window =
+                    activity.getWindow();
+            android.view.WindowManager.LayoutParams params =
+                    window.getAttributes();
+            params.alpha = 0.0f;
+            window.setAttributes(params);
+            window.getDecorView().setVisibility(
+                    View.INVISIBLE
+            );
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static void fetchMomentSnapshot(
+            final MomentSnapshotState state
+    ) {
+        if (state == null || state.cancelled) {
+            return;
+        }
+
+        synchronized (state) {
+            if (state.fetchStarted) {
+                return;
+            }
+            state.fetchStarted = true;
+        }
+
+        final ArrayList<Integer> userIds =
+                new ArrayList<>();
+        synchronized (state) {
+            userIds.addAll(state.userIds);
+        }
+
+        new Thread(
+                new Runnable() {
+                    @Override
+                    public void run() {
+                        ArrayList<Object> moments =
+                                loadMomentSnapshotUsers(
+                                        state,
+                                        userIds
+                                );
+
+                        final Object result =
+                                createMomentResult(
+                                        moments
+                                );
+
+                        state.running = false;
+
+                        post(
+                                new Runnable() {
+                                    @Override
+                                    public void run() {
+                                        Activity source =
+                                                state.source.get();
+                                        if (getMomentSnapshot(source)
+                                                != state) {
+                                            return;
+                                        }
+                                        if (source == null
+                                                || source.isFinishing()
+                                                || isDestroyed(source)) {
+                                            removeMomentSnapshot(source);
+                                            return;
+                                        }
+
+                                        try {
+                                            if (result == null) {
+                                                return;
+                                            }
+
+                                            XposedHelpers.callMethod(
+                                                    source,
+                                                    "showMomentList",
+                                                    result,
+                                                    0
+                                            );
+                                            log("[MOMENT_SNAPSHOT] users="
+                                                    + userIds.size()
+                                                    + " moments="
+                                                    + getMomentCount(
+                                                    momentsFromResult(result)
+                                            ));
+                                        } catch (Throwable t) {
+                                            log("[MOMENT_SNAPSHOT] show failed: "
+                                                    + t.getClass().getName());
+                                        }
+                                    }
+                                }
+                        );
+                    }
+                },
+                "ht-moment-snapshot"
+        ).start();
+    }
+
+    private static ArrayList<Object> loadMomentSnapshotUsers(
+            MomentSnapshotState state,
+            List<Integer> userIds
+    ) {
+        ArrayList<Object> result =
+                new ArrayList<>();
+        Set<String> seenMids =
+                new LinkedHashSet<>();
+
+        try {
+            Class<?> logicClass =
+                    XposedHelpers.findClass(
+                            "dg0.a",
+                            sCl
+                    );
+
+            for (Integer uid : userIds) {
+                if (uid == null || uid <= 0) {
+                    continue;
+                }
+
+                if (state.cancelled
+                        || Thread.currentThread().isInterrupted()) {
+                    break;
+                }
+
+                try {
+                    Object logic =
+                            XposedHelpers.newInstance(
+                                    logicClass
+                            );
+                    Object model =
+                            XposedHelpers.callMethod(
+                                    logic,
+                                    "R",
+                                    uid,
+                                    0,
+                                    5
+                            );
+                    Object listObject =
+                            XposedHelpers.callMethod(
+                                    model,
+                                    "getMoments"
+                            );
+
+                    if (!(listObject instanceof List)) {
+                        continue;
+                    }
+
+                    for (Object moment : (List<?>) listObject) {
+                        if (moment == null) {
+                            continue;
+                        }
+
+                        String mid =
+                                (String) XposedHelpers.callMethod(
+                                        moment,
+                                        "y0"
+                                );
+                        if (mid != null
+                                && !seenMids.add(mid)) {
+                            continue;
+                        }
+                        result.add(moment);
+                        if (result.size()
+                                >= SNAPSHOT_MAX_MOMENTS) {
+                            break;
+                        }
+                    }
+                } catch (Throwable t) {
+                    log("[MOMENT_SNAPSHOT] user moments failed: "
+                            + t.getClass().getName());
+                }
+
+                if (result.size()
+                        >= SNAPSHOT_MAX_MOMENTS) {
+                    break;
+                }
+            }
+
+            Collections.sort(
+                    result,
+                    new Comparator<Object>() {
+                        @Override
+                        public int compare(
+                                Object first,
+                                Object second
+                        ) {
+                            Date firstDate =
+                                    momentDate(first);
+                            Date secondDate =
+                                    momentDate(second);
+
+                            if (firstDate == null
+                                    && secondDate == null) {
+                                return 0;
+                            }
+                            if (firstDate == null) {
+                                return 1;
+                            }
+                            if (secondDate == null) {
+                                return -1;
+                            }
+                            return secondDate.compareTo(
+                                    firstDate
+                            );
+                        }
+                    }
+            );
+        } catch (Throwable t) {
+            log("[MOMENT_SNAPSHOT] aggregate failed: "
+                    + t.getClass().getName());
+        }
+
+        return result;
+    }
+
+    private static Date momentDate(Object moment) {
+        try {
+            return (Date) XposedHelpers.callMethod(
+                    moment,
+                    "v0"
+            );
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private static Object createMomentResult(
+            ArrayList<Object> moments
+    ) {
+        try {
+            Class<?> resultClass =
+                    XposedHelpers.findClass(
+                            "com.hellotalk.moment.common.model.MomentResultModel",
+                            sCl
+                    );
+            Object result =
+                    XposedHelpers.newInstance(
+                            resultClass
+                    );
+            XposedHelpers.callMethod(
+                    result,
+                    "setMoments",
+                    moments
+            );
+            XposedHelpers.callMethod(
+                    result,
+                    "setHasMore",
+                    0
+            );
+            XposedHelpers.callMethod(
+                    result,
+                    "setRetCode",
+                    0
+            );
+            return result;
+        } catch (Throwable t) {
+            log("[MOMENT_SNAPSHOT] result create failed: "
+                    + t.getClass().getName());
+            return null;
+        }
+    }
+
+    private static List<?> momentsFromResult(Object result) {
+        try {
+            Object value =
+                    XposedHelpers.callMethod(
+                            result,
+                            "getMoments"
+                    );
+            return value instanceof List
+                    ? (List<?>) value
+                    : null;
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private static int getMomentCount(List<?> moments) {
+        return moments == null ? 0 : moments.size();
+    }
+
+    private static MomentSnapshotState getMomentSnapshot(
+            Activity activity
+    ) {
+        if (activity == null) {
+            return null;
+        }
+        synchronized (MOMENT_SNAPSHOTS) {
+            return MOMENT_SNAPSHOTS.get(activity);
+        }
+    }
+
+    private static MomentSnapshotState findMomentSnapshot(
+            long generation
+    ) {
+        if (generation == 0L) {
+            return null;
+        }
+        synchronized (MOMENT_SNAPSHOTS) {
+            for (MomentSnapshotState state
+                    : MOMENT_SNAPSHOTS.values()) {
+                if (state != null
+                        && state.generation == generation) {
+                    return state;
+                }
+            }
+        }
+        return null;
+    }
+
+    private static MomentSnapshotState findMomentSnapshot(
+            Activity helper
+    ) {
+        if (helper == null) {
+            return null;
+        }
+        synchronized (MOMENT_SNAPSHOTS) {
+            for (MomentSnapshotState state
+                    : MOMENT_SNAPSHOTS.values()) {
+                if (state != null
+                        && state.helper.get() == helper) {
+                    return state;
+                }
+            }
+        }
+        return null;
+    }
+
+    private static MomentSnapshotState removeMomentSnapshot(
+            Activity activity
+    ) {
+        if (activity == null) {
+            return null;
+        }
+        synchronized (MOMENT_SNAPSHOTS) {
+            return MOMENT_SNAPSHOTS.remove(activity);
         }
     }
 
