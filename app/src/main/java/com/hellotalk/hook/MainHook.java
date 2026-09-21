@@ -53,6 +53,8 @@ public class MainHook implements IXposedHookLoadPackage {
 
     private static final long TIMEOUT_MS = 20000L;
     private static final long EMPTY_RECHECK_MS = 800L;
+    private static final int MAX_MOMENT_AUTO_PAGES = 5;
+    private static final long MOMENT_AUTO_PAGE_DELAY_MS = 300L;
 
     private interface HookTask {
         void run() throws Throwable;
@@ -61,6 +63,10 @@ public class MainHook implements IXposedHookLoadPackage {
     private static final class MomentFilterState {
         final ArrayList<Integer> teach;
         final ArrayList<Integer> learn;
+        int lastCandidates;
+        int lastMatched;
+        int autoPageCount;
+        boolean autoPageScheduled;
 
         MomentFilterState(
                 ArrayList<Integer> teach,
@@ -595,13 +601,33 @@ public class MainHook implements IXposedHookLoadPackage {
                                 return;
                             }
 
-                            putMomentFilter(
-                                    param.thisObject,
-                                    new MomentFilterState(
-                                            selectedTeach,
-                                            selectedLearn
-                                    )
-                            );
+                            int loadType =
+                                    param.args.length > 3
+                                            && param.args[3] instanceof Integer
+                                            ? (Integer) param.args[3]
+                                            : 0;
+                            MomentFilterState state =
+                                    getMomentFilter(param.thisObject);
+
+                            if (loadType == 0
+                                    || state == null
+                                    || !sameLanguages(
+                                    selectedTeach,
+                                    state.teach
+                            )
+                                    || !sameLanguages(
+                                    selectedLearn,
+                                    state.learn
+                            )) {
+                                state = new MomentFilterState(
+                                        selectedTeach,
+                                        selectedLearn
+                                );
+                                putMomentFilter(
+                                        param.thisObject,
+                                        state
+                                );
+                            }
 
                             param.args[1] = defaultTeach;
                             param.args[2] = defaultLearn;
@@ -671,6 +697,10 @@ public class MainHook implements IXposedHookLoadPackage {
                             }
 
                             List<?> moments = (List<?>) momentsObject;
+                            synchronized (state) {
+                                state.lastCandidates = 0;
+                                state.lastMatched = 0;
+                            }
                             ArrayList<Object> filtered = new ArrayList<>();
                             for (Object moment : moments) {
                                 if (matchesMomentLanguages(moment, state)) {
@@ -683,6 +713,11 @@ public class MainHook implements IXposedHookLoadPackage {
                                     "setMoments",
                                     filtered
                             );
+
+                            synchronized (state) {
+                                state.lastCandidates = moments.size();
+                                state.lastMatched = filtered.size();
+                            }
 
                             log("[MOMENT_LOCAL] candidates="
                                     + moments.size()
@@ -703,10 +738,121 @@ public class MainHook implements IXposedHookLoadPackage {
                                     + t.getClass().getName());
                         }
                     }
+
+                    @Override
+                    protected void afterHookedMethod(
+                            MethodHookParam param
+                    ) {
+                        try {
+                            Object presenter =
+                                    XposedHelpers.getObjectField(
+                                            param.thisObject,
+                                            "t"
+                                    );
+                            MomentFilterState state =
+                                    getMomentFilter(presenter);
+                            if (state == null || param.args[0] == null) {
+                                return;
+                            }
+
+                            int hasMore =
+                                    ((Integer) XposedHelpers.callMethod(
+                                            param.args[0],
+                                            "getHasMore"
+                                    ));
+                            int loadType =
+                                    param.args.length > 1
+                                            && param.args[1] instanceof Integer
+                                            ? (Integer) param.args[1]
+                                            : -1;
+                            int candidates;
+                            int matched;
+                            synchronized (state) {
+                                candidates = state.lastCandidates;
+                                matched = state.lastMatched;
+                            }
+
+                            log("[MOMENT_LOCAL] page candidates="
+                                    + candidates
+                                    + " matched="
+                                    + matched
+                                    + " hasMore="
+                                    + hasMore
+                                    + " loadType="
+                                    + loadType);
+
+                            if (matched == 0 && hasMore != 0) {
+                                scheduleMomentAutoPage(
+                                        (Activity) param.thisObject,
+                                        state
+                                );
+                            }
+                        } catch (Throwable t) {
+                            log("[MOMENT_LOCAL] page handling failed: "
+                                    + t.getClass().getName());
+                        }
+                    }
                 }
         );
 
         log("Moment local result filter hook OK");
+    }
+
+    private static void scheduleMomentAutoPage(
+            final Activity activity,
+            final MomentFilterState state
+    ) {
+        if (activity == null || state == null) {
+            return;
+        }
+
+        final int page;
+        synchronized (state) {
+            if (state.autoPageScheduled
+                    || state.autoPageCount >= MAX_MOMENT_AUTO_PAGES) {
+                return;
+            }
+            state.autoPageScheduled = true;
+            page = ++state.autoPageCount;
+        }
+
+        boolean posted = postDelayed(
+                new Runnable() {
+                    @Override
+                    public void run() {
+                        try {
+                            synchronized (state) {
+                                state.autoPageScheduled = false;
+                            }
+
+                            if (activity.isFinishing()
+                                    || isDestroyed(activity)) {
+                                return;
+                            }
+
+                            XposedHelpers.callMethod(
+                                    activity,
+                                    "onStartLoadMore"
+                            );
+
+                            log("[MOMENT_LOCAL] auto page=" + page);
+                        } catch (Throwable t) {
+                            synchronized (state) {
+                                state.autoPageScheduled = false;
+                            }
+                            log("[MOMENT_LOCAL] auto page failed: "
+                                    + t.getClass().getName());
+                        }
+                    }
+                },
+                MOMENT_AUTO_PAGE_DELAY_MS
+        );
+
+        if (!posted) {
+            synchronized (state) {
+                state.autoPageScheduled = false;
+            }
+        }
     }
 
     private static Object currentUserLanguage() {
