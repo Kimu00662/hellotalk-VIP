@@ -65,13 +65,6 @@ public class MainHook implements IXposedHookLoadPackage {
         safe(new HookTask() {
             @Override
             public void run() throws Throwable {
-                hookFilterVip();
-            }
-        });
-
-        safe(new HookTask() {
-            @Override
-            public void run() throws Throwable {
                 hookFilterClick();
             }
         });
@@ -154,30 +147,6 @@ public class MainHook implements IXposedHookLoadPackage {
             log("Handler postDelayed失败: " + t);
             return false;
         }
-    }
-
-    private static void hookFilterVip()
-            throws Throwable {
-        Class<?> cls =
-                XposedHelpers.findClass(
-                        "com.hellotalk.search.v2.logic.controller.searchuser.SearchFilterViewModelV2",
-                        sCl
-                );
-
-        XposedHelpers.findAndHookMethod(
-                cls,
-                "isVip",
-                new XC_MethodHook() {
-                    @Override
-                    protected void afterHookedMethod(
-                            MethodHookParam param
-                    ) {
-                        param.setResult(true);
-                    }
-                }
-        );
-
-        log("SearchFilterViewModelV2.isVip hook OK");
     }
 
     // ============================================================
