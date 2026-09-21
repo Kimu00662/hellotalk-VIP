@@ -143,6 +143,13 @@ public class MainHook implements IXposedHookLoadPackage {
         safe(new HookTask() {
             @Override
             public void run() throws Throwable {
+                hookMomentDefaultFeedRequest();
+            }
+        });
+
+        safe(new HookTask() {
+            @Override
+            public void run() throws Throwable {
                 hookMomentLocalResults();
             }
         });
@@ -561,15 +568,20 @@ public class MainHook implements IXposedHookLoadPackage {
                             ArrayList<Integer> selectedLearn =
                                     copyLanguageList(param.args[2]);
 
+                            Object requestObject =
+                                    getMomentRequest(param.thisObject);
+
                             if (selectedTeach.isEmpty()
                                     || selectedLearn.isEmpty()) {
                                 clearMomentFilter(param.thisObject);
+                                clearMomentFilter(requestObject);
                                 return;
                             }
 
                             Object userLanguage = currentUserLanguage();
                             if (userLanguage == null) {
                                 clearMomentFilter(param.thisObject);
+                                clearMomentFilter(requestObject);
                                 return;
                             }
 
@@ -598,6 +610,7 @@ public class MainHook implements IXposedHookLoadPackage {
                                     defaultLearn
                             ))) {
                                 clearMomentFilter(param.thisObject);
+                                clearMomentFilter(requestObject);
                                 return;
                             }
 
@@ -623,18 +636,23 @@ public class MainHook implements IXposedHookLoadPackage {
                                         selectedTeach,
                                         selectedLearn
                                 );
-                                putMomentFilter(
-                                        param.thisObject,
-                                        state
-                                );
                             }
 
-                            param.args[1] = defaultTeach;
-                            param.args[2] = defaultLearn;
+                            putMomentFilter(
+                                    param.thisObject,
+                                    state
+                            );
+                            putMomentFilter(
+                                    requestObject,
+                                    state
+                            );
 
                             log("[MOMENT_LOCAL] fallback request active");
                         } catch (Throwable t) {
                             clearMomentFilter(param.thisObject);
+                            clearMomentFilter(
+                                    getMomentRequest(param.thisObject)
+                            );
                             log("[MOMENT_LOCAL] fallback request failed: "
                                     + t.getClass().getName());
                         }
@@ -642,7 +660,71 @@ public class MainHook implements IXposedHookLoadPackage {
                 }
         );
 
-        log("Moment local fallback request hook OK");
+        log("Moment local fallback state hook OK");
+    }
+
+    private static void hookMomentDefaultFeedRequest()
+            throws Throwable {
+        Class<?> logicClass =
+                XposedHelpers.findClass(
+                        "ze0.y",
+                        sCl
+                );
+
+        XposedHelpers.findAndHookMethod(
+                logicClass,
+                "w",
+                int.class,
+                int.class,
+                int.class,
+                String.class,
+                String.class,
+                List.class,
+                List.class,
+                boolean.class,
+                int.class,
+                int.class,
+                boolean.class,
+                new XC_MethodHook() {
+                    @Override
+                    protected void beforeHookedMethod(
+                            MethodHookParam param
+                    ) {
+                        try {
+                            MomentFilterState state =
+                                    getMomentFilter(param.thisObject);
+                            if (state == null
+                                    || !(param.args[1] instanceof Integer)
+                                    || ((Integer) param.args[1]) != 30) {
+                                return;
+                            }
+
+                            param.args[1] = 0;
+                            log("[MOMENT_LOCAL] query type 30 -> 0");
+                        } catch (Throwable t) {
+                            log("[MOMENT_LOCAL] query fallback failed: "
+                                    + t.getClass().getName());
+                        }
+                    }
+                }
+        );
+
+        log("Moment default feed query hook OK");
+    }
+
+    private static Object getMomentRequest(Object presenter) {
+        if (presenter == null) {
+            return null;
+        }
+
+        try {
+            return XposedHelpers.getObjectField(
+                    presenter,
+                    "A"
+            );
+        } catch (Throwable ignored) {
+            return null;
+        }
     }
 
     private static void hookMomentLocalResults()
