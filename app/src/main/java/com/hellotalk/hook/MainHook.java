@@ -1278,13 +1278,7 @@ public class MainHook implements IXposedHookLoadPackage {
     };
 
     private static void hookDiag6090() {
-        hookDiagMethod("com.hellotalk.search.v2.view.SearchListFragment$d", "a");
-        hookDiagMethod("com.hellotalk.search.v2.view.SearchListFragment$h", "a");
-        hookDiagMethod("com.hellotalk.search.v2.logic.controller.searchuser.UserSearchFragment", "onClickUserItem");
         hookDiagMethod("com.hellotalk.search.v2.viewmodel.SearchUserViewModel", "goToProfile");
-        hookDiagMethod("com.hellotalk.search.v2.viewmodel.SearchListViewModel", "startToProfile");
-        hookDiagMethod("bx0.c", "f");
-        hookDiagMethod("bx0.c", "h");
     }
 
     private static void hookDiagMethod(
@@ -1311,36 +1305,26 @@ public class MainHook implements IXposedHookLoadPackage {
 
     private static void dumpDiag(String where, Object[] args) {
         try {
-            StringBuilder sb = new StringBuilder("[DIAG] " + where);
-            if (args != null) {
-                for (int i = 0; i < args.length; i++) {
-                    Object a = args[i];
-                    if (a == null) {
-                        sb.append(" | #").append(i).append("=null");
-                        continue;
+            if (args == null) {
+                return;
+            }
+            for (int i = 0; i < args.length; i++) {
+                Object a = args[i];
+                if (a == null) {
+                    continue;
+                }
+                String cn = a.getClass().getName();
+                if (!"ax0.f".equals(cn) && !"rl0.e".equals(cn)) {
+                    continue;
+                }
+                log("[DIAG] " + where + " uid=" + safeGet(a, "W"));
+                for (String m : DIAG_GETTERS) {
+                    Object v = safeGet(a, m);
+                    if (v != null) {
+                        log("[DIAG]   " + m + " = " + v);
                     }
-                    String cn = a.getClass().getName();
-                    if (a instanceof android.content.Context) {
-                        sb.append(" | #").append(i).append("=Context");
-                        continue;
-                    }
-                    if ("ax0.f".equals(cn) || "rl0.e".equals(cn)) {
-                        sb.append(" | #").append(i).append("=ITEM{uid=")
-                                .append(safeGet(a, "W"));
-                        for (String m : DIAG_GETTERS) {
-                            if ("W".equals(m)) continue;
-                            Object v = safeGet(a, m);
-                            if (v != null) {
-                                sb.append(", ").append(m).append("=").append(v);
-                            }
-                        }
-                        sb.append("}");
-                        continue;
-                    }
-                    sb.append(" | #").append(i).append("=").append(cn);
                 }
             }
-            log(sb.toString());
         } catch (Throwable t) {
             log("[DIAG] dump失败: " + t);
         }
