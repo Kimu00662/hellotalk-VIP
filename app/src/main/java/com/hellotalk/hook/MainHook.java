@@ -7,6 +7,9 @@ import android.os.Looper;
 import android.view.View;
 
 import java.lang.ref.WeakReference;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -108,6 +111,13 @@ public class MainHook implements IXposedHookLoadPackage {
             @Override
             public void run() throws Throwable {
                 hookFakeVip();
+            }
+        });
+
+        safe(new HookTask() {
+            @Override
+            public void run() throws Throwable {
+                startPerfDiag();
             }
         });
 
@@ -1650,6 +1660,242 @@ public class MainHook implements IXposedHookLoadPackage {
 
         } catch (Throwable t) {
             log("[BRIDGE6090] 跳转失败: " + t);
+        }
+    }
+
+    // ============================================================
+    // 性能诊断（临时，默认关）：定位“响应慢 / 滑动卡 / 发热耗电”
+    // 开关 perf_diag：开时启用
+    //   ① 主线程看门狗：每 300ms 查主线程是否卡住，卡住则抓主线程栈
+    //   ② CPU 采样：每 5s 统计各线程 CPU，输出 top 8 线程栈
+    // 关闭时不启动任何线程，对 HT 零影响。定位后删除。
+    // ============================================================
+
+    private static void startPerfDiag() {
+        if (!readPerfDiagConfig()) {
+            log("perfDiag: 开关关闭");
+            return;
+        }
+
+        log("perfDiag: 启动（主线程看门狗 + CPU采样）");
+
+        Thread wd = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                mainThreadWatchdog();
+            }
+        }, "HT_AI_PerfWD");
+        wd.setDaemon(true);
+        wd.start();
+
+        Thread cpu = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                cpuSampler();
+            }
+        }, "HT_AI_PerfCPU");
+        cpu.setDaemon(true);
+        cpu.start();
+    }
+
+    private static boolean readPerfDiagConfig() {
+        try {
+            java.io.File f = new java.io.File(SettingsActivity.CONFIG_PATH);
+            if (!f.exists()) {
+                return false;
+            }
+
+            java.io.BufferedReader r = new java.io.BufferedReader(
+                    new java.io.FileReader(f));
+            String line;
+            while ((line = r.readLine()) != null) {
+                line = line.trim();
+                if (line.startsWith(SettingsActivity.KEY_PERF_DIAG + "=")) {
+                    r.close();
+                    return "true".equalsIgnoreCase(
+                            line.substring(SettingsActivity.KEY_PERF_DIAG.length() + 1).trim());
+                }
+            }
+            r.close();
+        } catch (Throwable t) {
+            log("perfDiag: 读取配置失败: " + t);
+        }
+
+        return false;
+    }
+
+    private static void mainThreadWatchdog() {
+        android.os.Handler h = new android.os.Handler(android.os.Looper.getMainLooper());
+
+        while (true) {
+            final java.util.concurrent.atomic.AtomicBoolean done =
+                    new java.util.concurrent.atomic.AtomicBoolean(false);
+            final long postTime = System.currentTimeMillis();
+
+            h.post(new Runnable() {
+                @Override
+                public void run() {
+                    done.set(true);
+                }
+            });
+
+            try {
+                Thread.sleep(300);
+            } catch (Throwable ignored) {
+            }
+
+            if (!done.get()) {
+                long blockedMs = System.currentTimeMillis() - postTime;
+                log("perfDiag: 主线程阻塞 " + blockedMs + "ms\n" + mainThreadStack());
+            }
+        }
+    }
+
+    private static String mainThreadStack() {
+        try {
+            Thread main = android.os.Looper.getMainLooper().getThread();
+            StackTraceElement[] st = main.getStackTrace();
+            StringBuilder sb = new StringBuilder();
+            int shown = 0;
+            for (StackTraceElement e : st) {
+                String cn = e.getClassName();
+                if (cn == null || cn.startsWith("java.lang") || cn.startsWith("android.os")) {
+                    continue;
+                }
+                sb.append("\n    ").append(cn).append(".").append(e.getMethodName());
+                if (++shown >= 12) {
+                    break;
+                }
+            }
+            return sb.toString();
+        } catch (Throwable t) {
+            return "(取主线程栈失败: " + t + ")";
+        }
+    }
+
+    private static void cpuSampler() {
+        java.util.Map<Long, Long> prev = new java.util.HashMap<>();
+
+        while (true) {
+            try {
+                Thread.sleep(5000);
+            } catch (Throwable ignored) {
+            }
+
+            java.util.Map<Long, String> names = new java.util.HashMap<>();
+            java.util.Map<Long, Long> now = new java.util.HashMap<>();
+            java.util.Map<Long, Long> delta = new java.util.HashMap<>();
+            java.util.Map<Long, Thread> threads = new java.util.HashMap<>();
+
+            try {
+                java.util.Map<Thread, StackTraceElement[]> all =
+                        Thread.getAllStackTraces();
+                for (java.util.Map.Entry<Thread, StackTraceElement[]> en : all.entrySet()) {
+                    Thread th = en.getKey();
+                    long id = th.getId();
+                    names.put(id, th.getName());
+                    threads.put(id, th);
+                    long cpu = cpuTimeOf(id);
+                    if (cpu < 0) {
+                        continue;
+                    }
+                    now.put(id, cpu);
+                    Long p = prev.get(id);
+                    if (p != null) {
+                        delta.put(id, cpu - p);
+                    }
+                }
+            } catch (Throwable t) {
+                log("perfDiag: CPU采样失败: " + t);
+                prev = now;
+                continue;
+            }
+
+            prev = now;
+
+            if (delta.isEmpty()) {
+                continue;
+            }
+
+            List<java.util.Map.Entry<Long, Long>> sorted =
+                    new ArrayList<>(delta.entrySet());
+            Collections.sort(sorted, new java.util.Comparator<java.util.Map.Entry<Long, Long>>() {
+                @Override
+                public int compare(java.util.Map.Entry<Long, Long> a,
+                                   java.util.Map.Entry<Long, Long> b) {
+                    return Long.compare(b.getValue(), a.getValue());
+                }
+            });
+
+            StringBuilder sb = new StringBuilder("perfDiag: 5s CPU top:\n");
+            int n = 0;
+            for (java.util.Map.Entry<Long, Long> e : sorted) {
+                long id = e.getKey();
+                long ms = e.getValue() / 1000L;
+                if (ms < 50) {
+                    break;
+                }
+                sb.append("  [").append(ms).append("ms] ")
+                        .append(names.get(id))
+                        .append(" (tid=").append(id).append(")\n")
+                        .append(topFrames(threads.get(id)))
+                        .append("\n");
+                if (++n >= 8) {
+                    break;
+                }
+            }
+
+            if (n > 0) {
+                log(sb.toString());
+            }
+        }
+    }
+
+    private static long cpuTimeOf(long tid) {
+        try {
+            java.io.BufferedReader r = new java.io.BufferedReader(
+                    new java.io.FileReader("/proc/self/task/" + tid + "/stat"));
+            String line = r.readLine();
+            r.close();
+            if (line == null) {
+                return -1;
+            }
+            int end = line.lastIndexOf(')');
+            if (end < 0) {
+                return -1;
+            }
+            String[] f = line.substring(end + 2).trim().split("\\s+");
+            // 字段 14/15（0-based 11/12）= utime/stime，单位 tick
+            long utime = Long.parseLong(f[11]);
+            long stime = Long.parseLong(f[12]);
+            return (utime + stime) * 10000L;
+        } catch (Throwable t) {
+            return -1;
+        }
+    }
+
+    private static String topFrames(Thread th) {
+        if (th == null) {
+            return "";
+        }
+
+        try {
+            StackTraceElement[] st = th.getStackTrace();
+            StringBuilder sb = new StringBuilder();
+            int shown = 0;
+            for (StackTraceElement e : st) {
+                String cn = e.getClassName();
+                if (cn == null || cn.startsWith("java.lang") || cn.startsWith("android.os")) {
+                    continue;
+                }
+                sb.append("      ").append(cn).append(".").append(e.getMethodName()).append("\n");
+                if (++shown >= 6) {
+                    break;
+                }
+            }
+            return sb.toString();
+        } catch (Throwable t) {
+            return "";
         }
     }
 }
