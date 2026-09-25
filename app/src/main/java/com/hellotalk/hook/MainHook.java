@@ -117,13 +117,6 @@ public class MainHook implements IXposedHookLoadPackage {
         safe(new HookTask() {
             @Override
             public void run() throws Throwable {
-                startPerfDiag();
-            }
-        });
-
-        safe(new HookTask() {
-            @Override
-            public void run() throws Throwable {
                 applyBlockers();
             }
         });
@@ -1670,45 +1663,6 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    // ============================================================
-    // 性能诊断（临时，默认关）：定位“响应慢 / 滑动卡 / 发热耗电”
-    // 开关 perf_diag：开时启用
-    //   ① 主线程看门狗：每 300ms 查主线程是否卡住，卡住则抓主线程栈
-    //   ② CPU 采样：每 5s 统计各线程 CPU，输出 top 8 线程栈
-    // 关闭时不启动任何线程，对 HT 零影响。定位后删除。
-    // ============================================================
-
-    private static void startPerfDiag() {
-        if (!readPerfDiagConfig()) {
-            log("perfDiag: 开关关闭");
-            return;
-        }
-
-        log("perfDiag: 启动（主线程热点采样 + 线程CPU采样）");
-
-        Thread sampler = new Thread(new Runnable() {
-            @Override
-            public void run() {
-                mainThreadHotspotSampler();
-            }
-        }, "HT_AI_PerfSample");
-        sampler.setDaemon(true);
-        sampler.start();
-
-        Thread cpu = new Thread(new Runnable() {
-            @Override
-            public void run() {
-                cpuSampler();
-            }
-        }, "HT_AI_PerfCPU");
-        cpu.setDaemon(true);
-        cpu.start();
-    }
-
-    private static boolean readPerfDiagConfig() {
-        return readToggle(SettingsActivity.KEY_PERF_DIAG);
-    }
-
     private static boolean readToggle(String key) {
         try {
             java.io.File f = new java.io.File(SettingsActivity.CONFIG_PATH);
@@ -1736,23 +1690,18 @@ public class MainHook implements IXposedHookLoadPackage {
     }
 
     // ============================================================
-    // 屏蔽第三方重型 SDK（可开关，默认关）
-    // 各开关独立：哪个出问题就单独关掉。均对 6.0.90 生效。
+    // 提速：一键屏蔽第三方重型 SDK（开关默认关，仅 6.0.90）
+    // 全部为“把初始化/上报方法变 no-op”，不改界面与数据。
     // ============================================================
 
     private static void applyBlockers() {
-        if (readToggle(SettingsActivity.KEY_BLOCK_ADS)) {
-            blockAds();
+        if (!readToggle(SettingsActivity.KEY_SPEEDUP)) {
+            return;
         }
-        if (readToggle(SettingsActivity.KEY_BLOCK_LIVE)) {
-            blockLive();
-        }
-        if (readToggle(SettingsActivity.KEY_BLOCK_ANALYTICS)) {
-            blockAnalytics();
-        }
-        if (readToggle(SettingsActivity.KEY_BLOCK_CRASH)) {
-            blockCrash();
-        }
+        blockAds();
+        blockLive();
+        blockAnalytics();
+        blockCrash();
     }
 
     // 广告：AdMob + Facebook Audience Network
@@ -1820,197 +1769,4 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    // 每 10ms 采一次主线程栈，20s 汇总一次“热点”（按出现频率）——
-    // 频率高的栈就是主线程真正在干的事，直接暴露卡顿元凶。
-    private static void mainThreadHotspotSampler() {
-        Thread main = android.os.Looper.getMainLooper().getThread();
-        java.util.HashMap<String, Integer> counts = new java.util.HashMap<>();
-        long windowStart = System.currentTimeMillis();
-
-        while (true) {
-            try {
-                Thread.sleep(10);
-            } catch (Throwable ignored) {
-            }
-
-            try {
-                StackTraceElement[] st = main.getStackTrace();
-                String sig = hotspotSignature(st);
-                if (sig != null) {
-                    Integer c = counts.get(sig);
-                    counts.put(sig, c == null ? 1 : c + 1);
-                }
-            } catch (Throwable ignored) {
-            }
-
-            if (System.currentTimeMillis() - windowStart >= 20000L) {
-                flushHotspots(counts);
-                counts.clear();
-                windowStart = System.currentTimeMillis();
-            }
-        }
-    }
-
-    private static String hotspotSignature(StackTraceElement[] st) {
-        // 主线程空闲（等待消息）时跳过
-        for (StackTraceElement e : st) {
-            String cn = e.getClassName();
-            if ("android.os.MessageQueue".equals(cn)
-                    && "nativePollOnce".equals(e.getMethodName())) {
-                return null;
-            }
-        }
-
-        StringBuilder sb = new StringBuilder();
-        int n = 0;
-        for (StackTraceElement e : st) {
-            String cn = e.getClassName();
-            if (cn == null
-                    || cn.startsWith("java.lang")
-                    || cn.startsWith("android.os")
-                    || cn.startsWith("com.hellotalk.hook")
-                    || cn.startsWith("de.robv")
-                    || cn.startsWith("LSPHooker")) {
-                continue;
-            }
-            sb.append(cn).append(".").append(e.getMethodName()).append(" < ");
-            if (++n >= 5) {
-                break;
-            }
-        }
-        return n == 0 ? null : sb.toString();
-    }
-
-    private static void flushHotspots(java.util.HashMap<String, Integer> counts) {
-        if (counts.isEmpty()) {
-            return;
-        }
-
-        List<java.util.Map.Entry<String, Integer>> list =
-                new ArrayList<>(counts.entrySet());
-        Collections.sort(list, new java.util.Comparator<java.util.Map.Entry<String, Integer>>() {
-            @Override
-            public int compare(java.util.Map.Entry<String, Integer> a,
-                               java.util.Map.Entry<String, Integer> b) {
-                return Integer.compare(b.getValue(), a.getValue());
-            }
-        });
-
-        StringBuilder sb = new StringBuilder("perfDiag: 主线程热点 top（20s样本数）:\n");
-        int n = 0;
-        for (java.util.Map.Entry<String, Integer> e : list) {
-            sb.append("  ").append(e.getValue()).append("  ").append(e.getKey()).append("\n");
-            if (++n >= 12) {
-                break;
-            }
-        }
-        log(sb.toString());
-    }
-
-    // 直接遍历 /proc/self/task 统计各线程 CPU（不依赖 Java tid）
-    private static void cpuSampler() {
-        java.util.Map<Integer, Long> prev = new java.util.HashMap<>();
-
-        while (true) {
-            try {
-                Thread.sleep(5000);
-            } catch (Throwable ignored) {
-            }
-
-            java.util.Map<Integer, Long> now = new java.util.HashMap<>();
-            java.util.Map<Integer, String> names = new java.util.HashMap<>();
-
-            java.io.File[] tasks = new java.io.File("/proc/self/task").listFiles();
-            if (tasks == null) {
-                continue;
-            }
-
-            for (java.io.File t : tasks) {
-                int tid;
-                try {
-                    tid = Integer.parseInt(t.getName());
-                } catch (Throwable e) {
-                    continue;
-                }
-
-                String[] st = readTaskStat(tid);
-                if (st == null) {
-                    continue;
-                }
-
-                names.put(tid, st[0]);
-                try {
-                    now.put(tid, Long.parseLong(st[1]) + Long.parseLong(st[2]));
-                } catch (Throwable ignored) {
-                }
-            }
-
-            java.util.Map<Integer, Long> delta = new java.util.HashMap<>();
-            for (java.util.Map.Entry<Integer, Long> e : now.entrySet()) {
-                Long p = prev.get(e.getKey());
-                if (p != null) {
-                    delta.put(e.getKey(), e.getValue() - p);
-                }
-            }
-            prev = now;
-
-            if (delta.isEmpty()) {
-                continue;
-            }
-
-            List<java.util.Map.Entry<Integer, Long>> list =
-                    new ArrayList<>(delta.entrySet());
-            Collections.sort(list, new java.util.Comparator<java.util.Map.Entry<Integer, Long>>() {
-                @Override
-                public int compare(java.util.Map.Entry<Integer, Long> a,
-                                   java.util.Map.Entry<Integer, Long> b) {
-                    return Long.compare(b.getValue(), a.getValue());
-                }
-            });
-
-            StringBuilder sb = new StringBuilder("perfDiag: 5s 线程CPU top:\n");
-            int n = 0;
-            for (java.util.Map.Entry<Integer, Long> e : list) {
-                long ms = e.getValue() * 10000L / 1000L;
-                if (ms < 20) {
-                    break;
-                }
-                sb.append("  [").append(ms).append("ms] ")
-                        .append(names.get(e.getKey()))
-                        .append(" (tid=").append(e.getKey()).append(")\n");
-                if (++n >= 10) {
-                    break;
-                }
-            }
-
-            if (n > 0) {
-                log(sb.toString());
-            }
-        }
-    }
-
-    private static String[] readTaskStat(int tid) {
-        try {
-            java.io.BufferedReader r = new java.io.BufferedReader(
-                    new java.io.FileReader("/proc/self/task/" + tid + "/stat"));
-            String line = r.readLine();
-            r.close();
-            if (line == null) {
-                return null;
-            }
-
-            int l = line.indexOf('(');
-            int rr = line.lastIndexOf(')');
-            if (l < 0 || rr <= l) {
-                return null;
-            }
-
-            String comm = line.substring(l + 1, rr);
-            String[] f = line.substring(rr + 2).trim().split("\\s+");
-            // f[11]=utime, f[12]=stime
-            return new String[]{comm, f[11], f[12]};
-        } catch (Throwable t) {
-            return null;
-        }
-    }
 }

@@ -25,11 +25,7 @@ public class SettingsActivity extends Activity {
     public static final String CONFIG_PATH = "/data/local/tmp/htvip_config.txt";
 
     public static final String KEY_FAKE_VIP = "fake_vip";
-    public static final String KEY_PERF_DIAG = "perf_diag";
-    public static final String KEY_BLOCK_ADS = "block_ads";
-    public static final String KEY_BLOCK_LIVE = "block_live";
-    public static final String KEY_BLOCK_ANALYTICS = "block_analytics";
-    public static final String KEY_BLOCK_CRASH = "block_crash";
+    public static final String KEY_SPEEDUP = "speedup";
 
     private static final String PREFS = "htvip";
 
@@ -38,11 +34,7 @@ public class SettingsActivity extends Activity {
 
     static {
         TOGGLES.put(KEY_FAKE_VIP, "假VIP（6.0.90，解锁高级筛选等VIP功能）");
-        TOGGLES.put(KEY_BLOCK_ADS, "屏蔽广告（AdMob / Facebook Audience）");
-        TOGGLES.put(KEY_BLOCK_LIVE, "屏蔽直播/视频SDK（腾讯播放器，省电省内存）");
-        TOGGLES.put(KEY_BLOCK_ANALYTICS, "屏蔽统计与归因（AppsFlyer / 埋点上报）");
-        TOGGLES.put(KEY_BLOCK_CRASH, "屏蔽崩溃上报（Bugly / 火山日志）");
-        TOGGLES.put(KEY_PERF_DIAG, "性能诊断（记录卡顿/发热现场，临时用）");
+        TOGGLES.put(KEY_SPEEDUP, "提速（屏蔽广告/直播SDK/统计/崩溃上报，省电省内存）");
     }
 
     private final Map<String, Switch> switches = new LinkedHashMap<>();
@@ -68,8 +60,7 @@ public class SettingsActivity extends Activity {
         }
 
         TextView hint = new TextView(this);
-        hint.setText("关闭后对 HelloTalk 零修改。改动需保存并重启 HelloTalk 生效（保存需要 root）。"
-                + " 屏蔽类开关建议逐个开启、观察，哪个出问题就单独关掉。");
+        hint.setText("关闭后对 HelloTalk 零修改。改动需保存并重启 HelloTalk 生效（保存需要 root）。");
         hint.setTextSize(13f);
         hint.setTextColor(Color.GRAY);
         hint.setPadding(0, 0, 0, pad);
