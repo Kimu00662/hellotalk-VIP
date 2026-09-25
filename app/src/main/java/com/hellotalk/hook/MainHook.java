@@ -24,6 +24,9 @@ public class MainHook implements IXposedHookLoadPackage {
     private static ClassLoader sCl;
     private static volatile Handler sMainHandler;
 
+    // true = 6.0.90（f4.h 不存在、s8.h 存在）；false = 5.7.0
+    private static volatile boolean isHt6090 = false;
+
     private static final AtomicBoolean PENDING =
             new AtomicBoolean(false);
 
@@ -62,10 +65,17 @@ public class MainHook implements IXposedHookLoadPackage {
 
         sCl = lpparam.classLoader;
 
+        isHt6090 = XposedHelpers.findClassIfExists("f4.h", sCl) == null
+                && XposedHelpers.findClassIfExists("s8.h", sCl) != null;
+
         safe(new HookTask() {
             @Override
             public void run() throws Throwable {
-                hookFilterClick();
+                if (isHt6090) {
+                    hookFilterClick6090();
+                } else {
+                    hookFilterClick();
+                }
             }
         });
 
@@ -86,7 +96,11 @@ public class MainHook implements IXposedHookLoadPackage {
         safe(new HookTask() {
             @Override
             public void run() throws Throwable {
-                hookRefreshState();
+                if (isHt6090) {
+                    hookRefreshState6090();
+                } else {
+                    hookRefreshState();
+                }
             }
         });
 
@@ -97,14 +111,7 @@ public class MainHook implements IXposedHookLoadPackage {
             }
         });
 
-        safe(new HookTask() {
-            @Override
-            public void run() throws Throwable {
-                hookDiag6090();
-            }
-        });
-
-        log("=== HelloTalk Hook loaded ===");
+        log("=== HelloTalk Hook loaded (ht6090=" + isHt6090 + ") ===");
     }
 
     private static void safe(HookTask task) {
@@ -425,7 +432,7 @@ public class MainHook implements IXposedHookLoadPackage {
             Object binding =
                     XposedHelpers.getObjectField(
                             activity,
-                            "A"
+                            isHt6090 ? "B" : "A"
                     );
 
             if (binding == null) {
@@ -770,30 +777,13 @@ public class MainHook implements IXposedHookLoadPackage {
                                 return;
                             }
 
-                            Object snapshot =
-                                    XposedHelpers.callMethod(
-                                            adapter,
-                                            "r"
-                                    );
-
-                            if (snapshot == null) {
-                                clearAndFinishHelper();
-                                return;
-                            }
-
-                            Object listObject =
-                                    XposedHelpers.callMethod(
-                                            snapshot,
-                                            "d"
-                                    );
-
-                            if (!(listObject instanceof List)) {
-                                clearAndFinishHelper();
-                                return;
-                            }
-
                             List<?> list =
-                                    (List<?>) listObject;
+                                    readAdapterList(adapter);
+
+                            if (list == null) {
+                                clearAndFinishHelper();
+                                return;
+                            }
 
                             Object match =
                                     findMatchingUser(
@@ -945,10 +935,17 @@ public class MainHook implements IXposedHookLoadPackage {
                 new Runnable() {
                     @Override
                     public void run() {
-                        callNativeProfile(
-                                finalSource,
-                                finalItem
-                        );
+                        if (isHt6090) {
+                            openProfileByUid6090(
+                                    finalSource,
+                                    uid
+                            );
+                        } else {
+                            callNativeProfile(
+                                    finalSource,
+                                    finalItem
+                            );
+                        }
 
                         finishActivity(
                                 finalHelper
@@ -1112,6 +1109,11 @@ public class MainHook implements IXposedHookLoadPackage {
 
     private static int readUid(Object item) {
         try {
+            if (isHt6090) {
+                Object v = XposedHelpers.getObjectField(item, "Y");
+                return v instanceof Integer ? (Integer) v : 0;
+            }
+
             Object value =
                     XposedHelpers.callMethod(
                             item,
@@ -1134,7 +1136,7 @@ public class MainHook implements IXposedHookLoadPackage {
             Object value =
                     XposedHelpers.getObjectField(
                             item,
-                            "Y"
+                            isHt6090 ? "Z" : "Y"
                     );
 
             return value == null
@@ -1266,84 +1268,388 @@ public class MainHook implements IXposedHookLoadPackage {
     }
 
     // ============================================================
-    // 诊断（临时）：6.0.90 高级筛选 uid=0 点击链路
-    // 目的：确认点击入口与条目字段（uid / 用户名 getter），定位后删除
+    // 6.0.90 专用：高级筛选 userid=0 点击桥接
+    // 与 5.7.0 差异：入口=UserSearchFragment.onClickUserItem(View,int,ax0.f)；
+    //   条目 uid=字段 ax0.f.Y，username=字段 ax0.f.Z；
+    //   分页回调参数类型=s8.h（快照=s8.u，列表=s8.u.d()）；
+    //   跳主页=OtherProfileActivity.a9(Context, g1[uid])。
     // ============================================================
 
-    private static final String[] DIAG_GETTERS = {
-            "W", "C", "E", "G", "I", "O", "P", "Q", "Y", "Z",
-            "b", "b0", "g0", "h", "h0", "i0", "j", "j0", "k", "k0",
-            "l", "p", "q0", "s", "D", "F", "K", "L", "M", "N",
-            "T", "a0", "c0", "d0", "g", "i", "m", "n", "r", "v", "w", "z"
-    };
+    private static void hookFilterClick6090()
+            throws Throwable {
+        Class<?> fragClass =
+                XposedHelpers.findClass(
+                        "com.hellotalk.search.v2.logic.controller.searchuser.UserSearchFragment",
+                        sCl
+                );
 
-    private static void hookDiag6090() {
-        hookDiagMethod("com.hellotalk.search.v2.viewmodel.SearchUserViewModel", "goToProfile");
-    }
+        Class<?> viewClass =
+                XposedHelpers.findClass(
+                        "android.view.View",
+                        sCl
+                );
 
-    private static void hookDiagMethod(
-            final String className,
-            final String methodName
-    ) {
-        try {
-            Class<?> c = XposedHelpers.findClassIfExists(className, sCl);
-            if (c == null) {
-                log("[DIAG] 类不存在: " + className);
-                return;
-            }
-            XposedBridge.hookAllMethods(c, methodName, new XC_MethodHook() {
-                @Override
-                protected void beforeHookedMethod(MethodHookParam param) {
-                    dumpDiag(className + "." + methodName, param.args);
-                }
-            });
-            log("[DIAG] hook OK: " + className + "." + methodName);
-        } catch (Throwable t) {
-            log("[DIAG] hook 失败 " + className + "." + methodName + ": " + t);
-        }
-    }
+        Class<?> itemClass =
+                XposedHelpers.findClass(
+                        "ax0.f",
+                        sCl
+                );
 
-    private static void dumpDiag(String where, Object[] args) {
-        try {
-            if (args == null) {
-                return;
-            }
-            for (int i = 0; i < args.length; i++) {
-                Object a = args[i];
-                if (a == null) {
-                    continue;
-                }
-                String cn = a.getClass().getName();
-                if (!"ax0.f".equals(cn) && !"rl0.e".equals(cn)) {
-                    continue;
-                }
-                log("[DIAG] " + where + " uid=" + safeGet(a, "W"));
-                for (java.lang.reflect.Field f : a.getClass().getDeclaredFields()) {
-                    try {
-                        f.setAccessible(true);
-                        Object v = f.get(a);
-                        if (v == null) {
-                            continue;
+        XposedHelpers.findAndHookMethod(
+                fragClass,
+                "onClickUserItem",
+                viewClass,
+                int.class,
+                itemClass,
+                new XC_MethodHook() {
+                    @Override
+                    protected void beforeHookedMethod(
+                            MethodHookParam param
+                    ) {
+                        try {
+                            View view =
+                                    (View) param.args[0];
+
+                            Object item =
+                                    param.args[2];
+
+                            int uid =
+                                    readUid(item);
+
+                            String username =
+                                    normalize(
+                                            readUsername(item)
+                                    );
+
+                            log("[BRIDGE6090] click uid="
+                                    + uid
+                                    + " username="
+                                    + username);
+
+                            if (uid > 0) {
+                                return;
+                            }
+
+                            if (isBlank(username)) {
+                                return;
+                            }
+
+                            if (PENDING.get()) {
+                                param.setResult(null);
+                                return;
+                            }
+
+                            Integer cached =
+                                    UID_CACHE.get(username);
+
+                            if (cached != null
+                                    && cached > 0) {
+                                param.setResult(null);
+
+                                final Activity finalActivity =
+                                        activityFromView(view);
+
+                                final int finalUid =
+                                        cached;
+
+                                if (finalActivity != null) {
+                                    post(
+                                            new Runnable() {
+                                                @Override
+                                                public void run() {
+                                                    openProfileByUid6090(
+                                                            finalActivity,
+                                                            finalUid
+                                                    );
+                                                }
+                                            }
+                                    );
+                                }
+
+                                return;
+                            }
+
+                            Activity activity =
+                                    activityFromView(view);
+
+                            if (activity == null) {
+                                return;
+                            }
+
+                            if (!PENDING.compareAndSet(
+                                    false,
+                                    true
+                            )) {
+                                param.setResult(null);
+                                return;
+                            }
+
+                            long token =
+                                    TOKEN_COUNTER.incrementAndGet();
+
+                            pendingToken = token;
+                            fragmentToken = 0L;
+                            emptyCheckToken = 0L;
+                            pendingUsername = username;
+
+                            sourceActivity =
+                                    new WeakReference<>(
+                                            activity
+                                    );
+
+                            helperActivity =
+                                    new WeakReference<>(
+                                            null
+                                    );
+
+                            try {
+                                Class<?> idSearchClass =
+                                        XposedHelpers.findClass(
+                                                "com.hellotalk.search.v2.view.IDSearchActivity",
+                                                sCl
+                                        );
+
+                                Intent intent =
+                                        new Intent(
+                                                activity,
+                                                idSearchClass
+                                        );
+
+                                activity.startActivity(intent);
+                                activity.overridePendingTransition(
+                                        0,
+                                        0
+                                );
+
+                                param.setResult(null);
+
+                                log("[BRIDGE6090] IDSearchActivity launched");
+
+                                scheduleTimeout(token);
+
+                            } catch (Throwable launchError) {
+                                log("[BRIDGE6090] 启动ID搜索页失败: "
+                                        + launchError);
+
+                                clearPending();
+                            }
+
+                        } catch (Throwable t) {
+                            log("[BRIDGE6090] 点击处理失败: " + t);
+                            clearPending();
                         }
-                        String sv = String.valueOf(v);
-                        if (sv.isEmpty()) {
-                            continue;
-                        }
-                        log("[DIAG]   F." + f.getName() + " (" + f.getType().getSimpleName() + ") = " + sv);
-                    } catch (Throwable ignored) {
                     }
                 }
-            }
-        } catch (Throwable t) {
-            log("[DIAG] dump失败: " + t);
-        }
+        );
+
+        log("UserSearchFragment.onClickUserItem hook OK (6.0.90)");
     }
 
-    private static Object safeGet(Object obj, String method) {
+    private static void hookRefreshState6090()
+            throws Throwable {
+        Class<?> baseFragment =
+                XposedHelpers.findClass(
+                        "com.hellotalk.search.v2.logic.controller.searchuser.BaseUserPagingFragment",
+                        sCl
+                );
+
+        Class<?> loadStates =
+                XposedHelpers.findClass(
+                        "s8.h",
+                        sCl
+                );
+
+        XposedHelpers.findAndHookMethod(
+                baseFragment,
+                "onRefreshLoadState",
+                loadStates,
+                new XC_MethodHook() {
+                    @Override
+                    protected void afterHookedMethod(
+                            MethodHookParam param
+                    ) {
+                        try {
+                            if (!PENDING.get()) {
+                                return;
+                            }
+
+                            Object fragment =
+                                    param.thisObject;
+
+                            if (!isOurFragment(fragment)) {
+                                return;
+                            }
+
+                            Object state =
+                                    XposedHelpers.callMethod(
+                                            param.args[0],
+                                            "b"
+                                    );
+
+                            if (state == null) {
+                                return;
+                            }
+
+                            String stateClass =
+                                    state.getClass().getName();
+
+                            if ("s8.w$a".equals(stateClass)) {
+                                log("[BRIDGE6090] Paging refresh error");
+                                clearAndFinishHelper();
+                                return;
+                            }
+
+                            if (!"s8.w$c".equals(stateClass)) {
+                                return;
+                            }
+
+                            Object adapter =
+                                    XposedHelpers.getObjectField(
+                                            fragment,
+                                            "userListAdapter"
+                                    );
+
+                            if (adapter == null) {
+                                return;
+                            }
+
+                            List<?> list =
+                                    readAdapterList(adapter);
+
+                            if (list == null) {
+                                return;
+                            }
+
+                            String wanted =
+                                    pendingUsername;
+
+                            if (isBlank(wanted)) {
+                                return;
+                            }
+
+                            Object match =
+                                    findMatchingUser(
+                                            list,
+                                            wanted
+                                    );
+
+                            if (match != null) {
+                                int uid =
+                                        readUid(match);
+
+                                if (uid > 0) {
+                                    resolveUser(match, uid);
+                                }
+
+                                return;
+                            }
+
+                            if (list.isEmpty()) {
+                                scheduleEmptyRecheck(fragment);
+                            }
+
+                        } catch (Throwable t) {
+                            log("[BRIDGE6090] Paging状态处理失败: "
+                                    + t);
+                        }
+                    }
+                }
+        );
+
+        log("BaseUserPagingFragment.onRefreshLoadState hook OK (6.0.90)");
+    }
+
+    private static List<?> readAdapterList(
+            Object adapter
+    ) {
         try {
-            return XposedHelpers.callMethod(obj, method);
+            Object snapshot =
+                    XposedHelpers.callMethod(
+                            adapter,
+                            isHt6090 ? "t" : "r"
+                    );
+
+            if (snapshot == null) {
+                return null;
+            }
+
+            Object listObject =
+                    XposedHelpers.callMethod(
+                            snapshot,
+                            "d"
+                    );
+
+            if (listObject instanceof List) {
+                return (List<?>) listObject;
+            }
+
+        } catch (Throwable ignored) {
+        }
+
+        return null;
+    }
+
+    private static Activity activityFromView(
+            View view
+    ) {
+        try {
+            android.content.Context ctx =
+                    view.getContext();
+
+            while (ctx instanceof android.content.ContextWrapper) {
+                if (ctx instanceof Activity) {
+                    return (Activity) ctx;
+                }
+
+                ctx = ((android.content.ContextWrapper) ctx)
+                        .getBaseContext();
+            }
+
+        } catch (Throwable ignored) {
+        }
+
+        return null;
+    }
+
+    private static void openProfileByUid6090(
+            Activity source,
+            int uid
+    ) {
+        try {
+            Class<?> g1Class =
+                    XposedHelpers.findClass(
+                            "com.hellotalk.ht.base.common.g1",
+                            sCl
+                    );
+
+            Object g1 =
+                    XposedHelpers.newInstance(
+                            g1Class
+                    );
+
+            XposedHelpers.setIntField(
+                    g1,
+                    "a",
+                    uid
+            );
+
+            Class<?> profileClass =
+                    XposedHelpers.findClass(
+                            "com.hellotalk.profile.mvvm.view.activity.OtherProfileActivity",
+                            sCl
+                    );
+
+            XposedHelpers.callStaticMethod(
+                    profileClass,
+                    "a9",
+                    source,
+                    g1
+            );
+
+            log("[BRIDGE6090] openProfileByUid " + uid);
+
         } catch (Throwable t) {
-            return null;
+            log("[BRIDGE6090] 跳转失败: " + t);
         }
     }
 }
