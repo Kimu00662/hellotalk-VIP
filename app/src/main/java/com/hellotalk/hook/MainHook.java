@@ -15,6 +15,7 @@ import java.util.concurrent.atomic.AtomicLong;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.XC_MethodHook;
+import de.robv.android.xposed.XSharedPreferences;
 import de.robv.android.xposed.XposedBridge;
 import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage.LoadPackageParam;
@@ -87,6 +88,13 @@ public class MainHook implements IXposedHookLoadPackage {
             @Override
             public void run() throws Throwable {
                 hookRefreshState();
+            }
+        });
+
+        safe(new HookTask() {
+            @Override
+            public void run() throws Throwable {
+                hookFakeVip();
             }
         });
 
@@ -1173,5 +1181,67 @@ public class MainHook implements IXposedHookLoadPackage {
         XposedBridge.log(
                 "[HT] " + message
         );
+    }
+
+    // ============================================================
+    // 6.0.90 假 VIP
+    // 开关由 SettingsActivity 写入模块私有 prefs（htvip/fake_vip），
+    // 这里用 XSharedPreferences 跨进程读取。关闭时不注册任何 hook，对 HT 零修改。
+    // VipInfoUtils.r.c() 是整条 VIP 判定的总出口（r.f()/r.h() 优先采纳其返回值），
+    // 返回 100 即解锁高级筛选等全部 VIP 判定。
+    // ============================================================
+
+    private static void hookFakeVip() {
+        boolean enabled;
+
+        try {
+            XSharedPreferences prefs = new XSharedPreferences(
+                    "com.hellotalk.hook",
+                    SettingsActivity.PREFS
+            );
+            prefs.reload();
+            enabled = prefs.getBoolean(
+                    SettingsActivity.KEY_FAKE_VIP,
+                    false
+            );
+        } catch (Throwable t) {
+            log("假VIP: 读取开关失败: " + t);
+            return;
+        }
+
+        if (!enabled) {
+            log("假VIP: 开关关闭，不注册 hook");
+            return;
+        }
+
+        try {
+            Class<?> cls = XposedHelpers.findClassIfExists(
+                    "com.hellotalk.ht.base.data.utils.r",
+                    sCl
+            );
+
+            if (cls == null) {
+                log("假VIP: 未找到 VipInfoUtils(r)");
+                return;
+            }
+
+            XposedHelpers.findAndHookMethod(
+                    cls,
+                    "c",
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(
+                                MethodHookParam param
+                        ) {
+                            param.setResult(100);
+                        }
+                    }
+            );
+
+            log("假VIP: Hook VipInfoUtils.r.c() 注册成功（返回100）");
+
+        } catch (Throwable t) {
+            log("假VIP Hook 失败: " + t);
+        }
     }
 }
