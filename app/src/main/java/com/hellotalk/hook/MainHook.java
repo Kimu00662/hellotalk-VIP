@@ -1677,16 +1677,16 @@ public class MainHook implements IXposedHookLoadPackage {
             return;
         }
 
-        log("perfDiag: 启动（主线程看门狗 + CPU采样）");
+        log("perfDiag: 启动（主线程热点采样 + 线程CPU采样）");
 
-        Thread wd = new Thread(new Runnable() {
+        Thread sampler = new Thread(new Runnable() {
             @Override
             public void run() {
-                mainThreadWatchdog();
+                mainThreadHotspotSampler();
             }
-        }, "HT_AI_PerfWD");
-        wd.setDaemon(true);
-        wd.start();
+        }, "HT_AI_PerfSample");
+        sampler.setDaemon(true);
+        sampler.start();
 
         Thread cpu = new Thread(new Runnable() {
             @Override
@@ -1724,57 +1724,96 @@ public class MainHook implements IXposedHookLoadPackage {
         return false;
     }
 
-    private static void mainThreadWatchdog() {
-        android.os.Handler h = new android.os.Handler(android.os.Looper.getMainLooper());
+    // 每 10ms 采一次主线程栈，20s 汇总一次“热点”（按出现频率）——
+    // 频率高的栈就是主线程真正在干的事，直接暴露卡顿元凶。
+    private static void mainThreadHotspotSampler() {
+        Thread main = android.os.Looper.getMainLooper().getThread();
+        java.util.HashMap<String, Integer> counts = new java.util.HashMap<>();
+        long windowStart = System.currentTimeMillis();
 
         while (true) {
-            final java.util.concurrent.atomic.AtomicBoolean done =
-                    new java.util.concurrent.atomic.AtomicBoolean(false);
-            final long postTime = System.currentTimeMillis();
-
-            h.post(new Runnable() {
-                @Override
-                public void run() {
-                    done.set(true);
-                }
-            });
-
             try {
-                Thread.sleep(300);
+                Thread.sleep(10);
             } catch (Throwable ignored) {
             }
 
-            if (!done.get()) {
-                long blockedMs = System.currentTimeMillis() - postTime;
-                log("perfDiag: 主线程阻塞 " + blockedMs + "ms\n" + mainThreadStack());
+            try {
+                StackTraceElement[] st = main.getStackTrace();
+                String sig = hotspotSignature(st);
+                if (sig != null) {
+                    Integer c = counts.get(sig);
+                    counts.put(sig, c == null ? 1 : c + 1);
+                }
+            } catch (Throwable ignored) {
+            }
+
+            if (System.currentTimeMillis() - windowStart >= 20000L) {
+                flushHotspots(counts);
+                counts.clear();
+                windowStart = System.currentTimeMillis();
             }
         }
     }
 
-    private static String mainThreadStack() {
-        try {
-            Thread main = android.os.Looper.getMainLooper().getThread();
-            StackTraceElement[] st = main.getStackTrace();
-            StringBuilder sb = new StringBuilder();
-            int shown = 0;
-            for (StackTraceElement e : st) {
-                String cn = e.getClassName();
-                if (cn == null || cn.startsWith("java.lang") || cn.startsWith("android.os")) {
-                    continue;
-                }
-                sb.append("\n    ").append(cn).append(".").append(e.getMethodName());
-                if (++shown >= 12) {
-                    break;
-                }
+    private static String hotspotSignature(StackTraceElement[] st) {
+        // 主线程空闲（等待消息）时跳过
+        for (StackTraceElement e : st) {
+            String cn = e.getClassName();
+            if ("android.os.MessageQueue".equals(cn)
+                    && "nativePollOnce".equals(e.getMethodName())) {
+                return null;
             }
-            return sb.toString();
-        } catch (Throwable t) {
-            return "(取主线程栈失败: " + t + ")";
         }
+
+        StringBuilder sb = new StringBuilder();
+        int n = 0;
+        for (StackTraceElement e : st) {
+            String cn = e.getClassName();
+            if (cn == null
+                    || cn.startsWith("java.lang")
+                    || cn.startsWith("android.os")
+                    || cn.startsWith("com.hellotalk.hook")
+                    || cn.startsWith("de.robv")
+                    || cn.startsWith("LSPHooker")) {
+                continue;
+            }
+            sb.append(cn).append(".").append(e.getMethodName()).append(" < ");
+            if (++n >= 5) {
+                break;
+            }
+        }
+        return n == 0 ? null : sb.toString();
     }
 
+    private static void flushHotspots(java.util.HashMap<String, Integer> counts) {
+        if (counts.isEmpty()) {
+            return;
+        }
+
+        List<java.util.Map.Entry<String, Integer>> list =
+                new ArrayList<>(counts.entrySet());
+        Collections.sort(list, new java.util.Comparator<java.util.Map.Entry<String, Integer>>() {
+            @Override
+            public int compare(java.util.Map.Entry<String, Integer> a,
+                               java.util.Map.Entry<String, Integer> b) {
+                return Integer.compare(b.getValue(), a.getValue());
+            }
+        });
+
+        StringBuilder sb = new StringBuilder("perfDiag: 主线程热点 top（20s样本数）:\n");
+        int n = 0;
+        for (java.util.Map.Entry<String, Integer> e : list) {
+            sb.append("  ").append(e.getValue()).append("  ").append(e.getKey()).append("\n");
+            if (++n >= 12) {
+                break;
+            }
+        }
+        log(sb.toString());
+    }
+
+    // 直接遍历 /proc/self/task 统计各线程 CPU（不依赖 Java tid）
     private static void cpuSampler() {
-        java.util.Map<Long, Long> prev = new java.util.HashMap<>();
+        java.util.Map<Integer, Long> prev = new java.util.HashMap<>();
 
         while (true) {
             try {
@@ -1782,65 +1821,68 @@ public class MainHook implements IXposedHookLoadPackage {
             } catch (Throwable ignored) {
             }
 
-            java.util.Map<Long, String> names = new java.util.HashMap<>();
-            java.util.Map<Long, Long> now = new java.util.HashMap<>();
-            java.util.Map<Long, Long> delta = new java.util.HashMap<>();
-            java.util.Map<Long, Thread> threads = new java.util.HashMap<>();
+            java.util.Map<Integer, Long> now = new java.util.HashMap<>();
+            java.util.Map<Integer, String> names = new java.util.HashMap<>();
 
-            try {
-                java.util.Map<Thread, StackTraceElement[]> all =
-                        Thread.getAllStackTraces();
-                for (java.util.Map.Entry<Thread, StackTraceElement[]> en : all.entrySet()) {
-                    Thread th = en.getKey();
-                    long id = th.getId();
-                    names.put(id, th.getName());
-                    threads.put(id, th);
-                    long cpu = cpuTimeOf(id);
-                    if (cpu < 0) {
-                        continue;
-                    }
-                    now.put(id, cpu);
-                    Long p = prev.get(id);
-                    if (p != null) {
-                        delta.put(id, cpu - p);
-                    }
-                }
-            } catch (Throwable t) {
-                log("perfDiag: CPU采样失败: " + t);
-                prev = now;
+            java.io.File[] tasks = new java.io.File("/proc/self/task").listFiles();
+            if (tasks == null) {
                 continue;
             }
 
+            for (java.io.File t : tasks) {
+                int tid;
+                try {
+                    tid = Integer.parseInt(t.getName());
+                } catch (Throwable e) {
+                    continue;
+                }
+
+                String[] st = readTaskStat(tid);
+                if (st == null) {
+                    continue;
+                }
+
+                names.put(tid, st[0]);
+                try {
+                    now.put(tid, Long.parseLong(st[1]) + Long.parseLong(st[2]));
+                } catch (Throwable ignored) {
+                }
+            }
+
+            java.util.Map<Integer, Long> delta = new java.util.HashMap<>();
+            for (java.util.Map.Entry<Integer, Long> e : now.entrySet()) {
+                Long p = prev.get(e.getKey());
+                if (p != null) {
+                    delta.put(e.getKey(), e.getValue() - p);
+                }
+            }
             prev = now;
 
             if (delta.isEmpty()) {
                 continue;
             }
 
-            List<java.util.Map.Entry<Long, Long>> sorted =
+            List<java.util.Map.Entry<Integer, Long>> list =
                     new ArrayList<>(delta.entrySet());
-            Collections.sort(sorted, new java.util.Comparator<java.util.Map.Entry<Long, Long>>() {
+            Collections.sort(list, new java.util.Comparator<java.util.Map.Entry<Integer, Long>>() {
                 @Override
-                public int compare(java.util.Map.Entry<Long, Long> a,
-                                   java.util.Map.Entry<Long, Long> b) {
+                public int compare(java.util.Map.Entry<Integer, Long> a,
+                                   java.util.Map.Entry<Integer, Long> b) {
                     return Long.compare(b.getValue(), a.getValue());
                 }
             });
 
-            StringBuilder sb = new StringBuilder("perfDiag: 5s CPU top:\n");
+            StringBuilder sb = new StringBuilder("perfDiag: 5s 线程CPU top:\n");
             int n = 0;
-            for (java.util.Map.Entry<Long, Long> e : sorted) {
-                long id = e.getKey();
-                long ms = e.getValue() / 1000L;
-                if (ms < 50) {
+            for (java.util.Map.Entry<Integer, Long> e : list) {
+                long ms = e.getValue() * 10000L / 1000L;
+                if (ms < 20) {
                     break;
                 }
                 sb.append("  [").append(ms).append("ms] ")
-                        .append(names.get(id))
-                        .append(" (tid=").append(id).append(")\n")
-                        .append(topFrames(threads.get(id)))
-                        .append("\n");
-                if (++n >= 8) {
+                        .append(names.get(e.getKey()))
+                        .append(" (tid=").append(e.getKey()).append(")\n");
+                if (++n >= 10) {
                     break;
                 }
             }
@@ -1851,51 +1893,28 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    private static long cpuTimeOf(long tid) {
+    private static String[] readTaskStat(int tid) {
         try {
             java.io.BufferedReader r = new java.io.BufferedReader(
                     new java.io.FileReader("/proc/self/task/" + tid + "/stat"));
             String line = r.readLine();
             r.close();
             if (line == null) {
-                return -1;
+                return null;
             }
-            int end = line.lastIndexOf(')');
-            if (end < 0) {
-                return -1;
-            }
-            String[] f = line.substring(end + 2).trim().split("\\s+");
-            // 字段 14/15（0-based 11/12）= utime/stime，单位 tick
-            long utime = Long.parseLong(f[11]);
-            long stime = Long.parseLong(f[12]);
-            return (utime + stime) * 10000L;
-        } catch (Throwable t) {
-            return -1;
-        }
-    }
 
-    private static String topFrames(Thread th) {
-        if (th == null) {
-            return "";
-        }
-
-        try {
-            StackTraceElement[] st = th.getStackTrace();
-            StringBuilder sb = new StringBuilder();
-            int shown = 0;
-            for (StackTraceElement e : st) {
-                String cn = e.getClassName();
-                if (cn == null || cn.startsWith("java.lang") || cn.startsWith("android.os")) {
-                    continue;
-                }
-                sb.append("      ").append(cn).append(".").append(e.getMethodName()).append("\n");
-                if (++shown >= 6) {
-                    break;
-                }
+            int l = line.indexOf('(');
+            int rr = line.lastIndexOf(')');
+            if (l < 0 || rr <= l) {
+                return null;
             }
-            return sb.toString();
+
+            String comm = line.substring(l + 1, rr);
+            String[] f = line.substring(rr + 2).trim().split("\\s+");
+            // f[11]=utime, f[12]=stime
+            return new String[]{comm, f[11], f[12]};
         } catch (Throwable t) {
-            return "";
+            return null;
         }
     }
 }
