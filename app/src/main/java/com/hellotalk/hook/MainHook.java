@@ -97,6 +97,13 @@ public class MainHook implements IXposedHookLoadPackage {
             }
         });
 
+        safe(new HookTask() {
+            @Override
+            public void run() throws Throwable {
+                hookDiag6090();
+            }
+        });
+
         log("=== HelloTalk Hook loaded ===");
     }
 
@@ -1256,5 +1263,94 @@ public class MainHook implements IXposedHookLoadPackage {
         }
 
         return false;
+    }
+
+    // ============================================================
+    // 诊断（临时）：6.0.90 高级筛选 uid=0 点击链路
+    // 目的：确认点击入口与条目字段（uid / 用户名 getter），定位后删除
+    // ============================================================
+
+    private static final String[] DIAG_GETTERS = {
+            "W", "C", "E", "G", "I", "O", "P", "Q", "Y", "Z",
+            "b", "b0", "g0", "h", "h0", "i0", "j", "j0", "k", "k0",
+            "l", "p", "q0", "s", "D", "F", "K", "L", "M", "N",
+            "T", "a0", "c0", "d0", "g", "i", "m", "n", "r", "v", "w", "z"
+    };
+
+    private static void hookDiag6090() {
+        hookDiagMethod("com.hellotalk.search.v2.view.SearchListFragment$d", "a");
+        hookDiagMethod("com.hellotalk.search.v2.view.SearchListFragment$h", "a");
+        hookDiagMethod("com.hellotalk.search.v2.logic.controller.searchuser.UserSearchFragment", "onClickUserItem");
+        hookDiagMethod("com.hellotalk.search.v2.viewmodel.SearchUserViewModel", "goToProfile");
+        hookDiagMethod("com.hellotalk.search.v2.viewmodel.SearchListViewModel", "startToProfile");
+        hookDiagMethod("bx0.c", "f");
+        hookDiagMethod("bx0.c", "h");
+    }
+
+    private static void hookDiagMethod(
+            final String className,
+            final String methodName
+    ) {
+        try {
+            Class<?> c = XposedHelpers.findClassIfExists(className, sCl);
+            if (c == null) {
+                log("[DIAG] 类不存在: " + className);
+                return;
+            }
+            XposedBridge.hookAllMethods(c, methodName, new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) {
+                    dumpDiag(className + "." + methodName, param.args);
+                }
+            });
+            log("[DIAG] hook OK: " + className + "." + methodName);
+        } catch (Throwable t) {
+            log("[DIAG] hook 失败 " + className + "." + methodName + ": " + t);
+        }
+    }
+
+    private static void dumpDiag(String where, Object[] args) {
+        try {
+            StringBuilder sb = new StringBuilder("[DIAG] " + where);
+            if (args != null) {
+                for (int i = 0; i < args.length; i++) {
+                    Object a = args[i];
+                    if (a == null) {
+                        sb.append(" | #").append(i).append("=null");
+                        continue;
+                    }
+                    String cn = a.getClass().getName();
+                    if (a instanceof android.content.Context) {
+                        sb.append(" | #").append(i).append("=Context");
+                        continue;
+                    }
+                    if ("ax0.f".equals(cn) || "rl0.e".equals(cn)) {
+                        sb.append(" | #").append(i).append("=ITEM{uid=")
+                                .append(safeGet(a, "W"));
+                        for (String m : DIAG_GETTERS) {
+                            if ("W".equals(m)) continue;
+                            Object v = safeGet(a, m);
+                            if (v != null) {
+                                sb.append(", ").append(m).append("=").append(v);
+                            }
+                        }
+                        sb.append("}");
+                        continue;
+                    }
+                    sb.append(" | #").append(i).append("=").append(cn);
+                }
+            }
+            log(sb.toString());
+        } catch (Throwable t) {
+            log("[DIAG] dump失败: " + t);
+        }
+    }
+
+    private static Object safeGet(Object obj, String method) {
+        try {
+            return XposedHelpers.callMethod(obj, method);
+        } catch (Throwable t) {
+            return null;
+        }
     }
 }
