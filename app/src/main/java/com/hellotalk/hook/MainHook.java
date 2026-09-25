@@ -121,6 +121,13 @@ public class MainHook implements IXposedHookLoadPackage {
             }
         });
 
+        safe(new HookTask() {
+            @Override
+            public void run() throws Throwable {
+                applyBlockers();
+            }
+        });
+
         log("=== HelloTalk Hook loaded (ht6090=" + isHt6090 + ") ===");
     }
 
@@ -1699,6 +1706,10 @@ public class MainHook implements IXposedHookLoadPackage {
     }
 
     private static boolean readPerfDiagConfig() {
+        return readToggle(SettingsActivity.KEY_PERF_DIAG);
+    }
+
+    private static boolean readToggle(String key) {
         try {
             java.io.File f = new java.io.File(SettingsActivity.CONFIG_PATH);
             if (!f.exists()) {
@@ -1710,18 +1721,103 @@ public class MainHook implements IXposedHookLoadPackage {
             String line;
             while ((line = r.readLine()) != null) {
                 line = line.trim();
-                if (line.startsWith(SettingsActivity.KEY_PERF_DIAG + "=")) {
+                if (line.startsWith(key + "=")) {
                     r.close();
                     return "true".equalsIgnoreCase(
-                            line.substring(SettingsActivity.KEY_PERF_DIAG.length() + 1).trim());
+                            line.substring(key.length() + 1).trim());
                 }
             }
             r.close();
         } catch (Throwable t) {
-            log("perfDiag: 读取配置失败: " + t);
+            log("读取开关失败(" + key + "): " + t);
         }
 
         return false;
+    }
+
+    // ============================================================
+    // 屏蔽第三方重型 SDK（可开关，默认关）
+    // 各开关独立：哪个出问题就单独关掉。均对 6.0.90 生效。
+    // ============================================================
+
+    private static void applyBlockers() {
+        if (readToggle(SettingsActivity.KEY_BLOCK_ADS)) {
+            blockAds();
+        }
+        if (readToggle(SettingsActivity.KEY_BLOCK_LIVE)) {
+            blockLive();
+        }
+        if (readToggle(SettingsActivity.KEY_BLOCK_ANALYTICS)) {
+            blockAnalytics();
+        }
+        if (readToggle(SettingsActivity.KEY_BLOCK_CRASH)) {
+            blockCrash();
+        }
+    }
+
+    // 广告：AdMob + Facebook Audience Network
+    private static void blockAds() {
+        blockVoid("com.google.android.gms.ads.MobileAds", "initialize");
+        blockVoid("com.facebook.ads.AudienceNetworkAds", "initialize");
+        log("屏蔽广告: 已注册");
+    }
+
+    // 直播/视频：腾讯播放器初始化（加载 libdownloadproxy.so 等）
+    private static void blockLive() {
+        blockVoid("com.tencent.thumbplayer.tcmedia.api.TPPlayerMgr", "initSdk");
+        log("屏蔽直播/视频SDK: 已注册");
+    }
+
+    // 统计与归因：AppsFlyer
+    private static void blockAnalytics() {
+        // init 返回 AppsFlyerLib（即 this），直接返回自身避免 NPE
+        blockReturnThis("com.appsflyer.internal.AFa1bSDK", "init");
+        blockVoid("com.appsflyer.internal.AFa1bSDK", "logEvent");
+        log("屏蔽统计与归因: 已注册");
+    }
+
+    // 崩溃上报：腾讯 Bugly
+    private static void blockCrash() {
+        blockVoid("com.tencent.bugly.idasc.crashreport.CrashReport", "initCrashReport");
+        log("屏蔽崩溃上报: 已注册");
+    }
+
+    private static void blockVoid(String className, String methodName) {
+        try {
+            Class<?> c = XposedHelpers.findClassIfExists(className, sCl);
+            if (c == null) {
+                log("屏蔽: 类不存在 " + className);
+                return;
+            }
+            XposedBridge.hookAllMethods(c, methodName, new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) {
+                    param.setResult(null);
+                }
+            });
+            log("屏蔽: " + className + "." + methodName + " -> no-op");
+        } catch (Throwable t) {
+            log("屏蔽失败 " + className + "." + methodName + ": " + t);
+        }
+    }
+
+    private static void blockReturnThis(String className, String methodName) {
+        try {
+            Class<?> c = XposedHelpers.findClassIfExists(className, sCl);
+            if (c == null) {
+                log("屏蔽: 类不存在 " + className);
+                return;
+            }
+            XposedBridge.hookAllMethods(c, methodName, new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) {
+                    param.setResult(param.thisObject);
+                }
+            });
+            log("屏蔽: " + className + "." + methodName + " -> this");
+        } catch (Throwable t) {
+            log("屏蔽失败 " + className + "." + methodName + ": " + t);
+        }
     }
 
     // 每 10ms 采一次主线程栈，20s 汇总一次“热点”（按出现频率）——
