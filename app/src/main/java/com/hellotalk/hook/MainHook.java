@@ -1318,10 +1318,19 @@ public class MainHook implements IXposedHookLoadPackage {
                     continue;
                 }
                 log("[DIAG] " + where + " uid=" + safeGet(a, "W"));
-                for (String m : DIAG_GETTERS) {
-                    Object v = safeGet(a, m);
-                    if (v != null) {
-                        log("[DIAG]   " + m + " = " + v);
+                for (java.lang.reflect.Field f : a.getClass().getDeclaredFields()) {
+                    try {
+                        f.setAccessible(true);
+                        Object v = f.get(a);
+                        if (v == null) {
+                            continue;
+                        }
+                        String sv = String.valueOf(v);
+                        if (sv.isEmpty()) {
+                            continue;
+                        }
+                        log("[DIAG]   F." + f.getName() + " (" + f.getType().getSimpleName() + ") = " + sv);
+                    } catch (Throwable ignored) {
                     }
                 }
             }
