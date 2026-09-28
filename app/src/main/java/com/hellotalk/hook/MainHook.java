@@ -71,7 +71,7 @@ public class MainHook implements IXposedHookLoadPackage {
         isHt6090 = XposedHelpers.findClassIfExists("f4.h", sCl) == null
                 && XposedHelpers.findClassIfExists("s8.h", sCl) != null;
 
-        // === 实验版：临时禁用桥接（保留假VIP/提速），用于隔离测试假VIP是否独立触发风控 ===
+        // === 临时禁用桥接：优先单独验证“掩盖VIP状态上报”是否有效 ===
         // safe(new HookTask() {
         //     @Override
         //     public void run() throws Throwable {
@@ -1243,8 +1243,54 @@ public class MainHook implements IXposedHookLoadPackage {
 
             log("假VIP: Hook VipInfoUtils.r.c() 注册成功（返回100）");
 
+            hookVipStatusReport();
+
         } catch (Throwable t) {
             log("假VIP Hook 失败: " + t);
+        }
+    }
+
+    // ============================================================
+    // 掩盖 VIP 状态自检上报
+    // 官方 MainBackgroundStartupTask 会 new f(r.f(), vipExpire) 上报：
+    //   {"client_vip_status": f(), "server_vip_status": vipExpire, ...}
+    // 假VIP 令 f() 返回 100，与服务端不符 => 触发官方“非正版”风控。
+    // 这里只把上报的第 1 个参数（client_vip_status）改回 0（非VIP），
+    // 使上报内容自洽；不影响 UI 侧的假VIP（r.c() 仍返回 100）。
+    // 关闭假VIP 时该方法不注册，对 HT 零修改。
+    // ============================================================
+
+    private static void hookVipStatusReport() {
+        try {
+            Class<?> cls = XposedHelpers.findClassIfExists(
+                    "com.hellotalk.lib.main.logic.f",
+                    sCl
+            );
+
+            if (cls == null) {
+                log("掩盖上报: 未找到 VIP状态上报类 f");
+                return;
+            }
+
+            XposedHelpers.findAndHookMethod(
+                    cls,
+                    "<init>",
+                    int.class,
+                    long.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(
+                                MethodHookParam param
+                        ) {
+                            param.args[0] = 0;
+                        }
+                    }
+            );
+
+            log("掩盖上报: Hook f.<init>(I,J) 注册成功（client_vip_status->0）");
+
+        } catch (Throwable t) {
+            log("掩盖上报 Hook 失败: " + t);
         }
     }
 

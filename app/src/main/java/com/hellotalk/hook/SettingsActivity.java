@@ -55,13 +55,6 @@ public class SettingsActivity extends Activity {
         title.setPadding(0, 0, 0, pad);
         root.addView(title);
 
-        TextView expTag = new TextView(this);
-        expTag.setText("【实验版】已禁用桥接，仅保留假VIP/提速");
-        expTag.setTextSize(14f);
-        expTag.setTextColor(Color.rgb(200, 0, 0));
-        expTag.setPadding(0, 0, 0, pad);
-        root.addView(expTag);
-
         for (Map.Entry<String, String> e : TOGGLES.entrySet()) {
             root.addView(buildRow(e.getKey(), e.getValue(), pad));
         }
