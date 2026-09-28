@@ -71,41 +71,42 @@ public class MainHook implements IXposedHookLoadPackage {
         isHt6090 = XposedHelpers.findClassIfExists("f4.h", sCl) == null
                 && XposedHelpers.findClassIfExists("s8.h", sCl) != null;
 
-        safe(new HookTask() {
-            @Override
-            public void run() throws Throwable {
-                if (isHt6090) {
-                    hookFilterClick6090();
-                } else {
-                    hookFilterClick();
-                }
-            }
-        });
-
-        safe(new HookTask() {
-            @Override
-            public void run() throws Throwable {
-                hookIdSearchInit();
-            }
-        });
-
-        safe(new HookTask() {
-            @Override
-            public void run() throws Throwable {
-                hookUsernameFragmentInit();
-            }
-        });
-
-        safe(new HookTask() {
-            @Override
-            public void run() throws Throwable {
-                if (isHt6090) {
-                    hookRefreshState6090();
-                } else {
-                    hookRefreshState();
-                }
-            }
-        });
+        // === 实验版：临时禁用桥接（保留假VIP/提速），用于隔离测试假VIP是否独立触发风控 ===
+        // safe(new HookTask() {
+        //     @Override
+        //     public void run() throws Throwable {
+        //         if (isHt6090) {
+        //             hookFilterClick6090();
+        //         } else {
+        //             hookFilterClick();
+        //         }
+        //     }
+        // });
+        //
+        // safe(new HookTask() {
+        //     @Override
+        //     public void run() throws Throwable {
+        //         hookIdSearchInit();
+        //     }
+        // });
+        //
+        // safe(new HookTask() {
+        //     @Override
+        //     public void run() throws Throwable {
+        //         hookUsernameFragmentInit();
+        //     }
+        // });
+        //
+        // safe(new HookTask() {
+        //     @Override
+        //     public void run() throws Throwable {
+        //         if (isHt6090) {
+        //             hookRefreshState6090();
+        //         } else {
+        //             hookRefreshState();
+        //         }
+        //     }
+        // });
 
         safe(new HookTask() {
             @Override
