@@ -1272,11 +1272,27 @@ public class MainHook implements IXposedHookLoadPackage {
                 return;
             }
 
-            XposedHelpers.findAndHookMethod(
-                    cls,
-                    "<init>",
-                    int.class,
-                    long.class,
+            java.lang.reflect.Constructor<?> target = null;
+            StringBuilder all = new StringBuilder();
+            for (java.lang.reflect.Constructor<?> c : cls.getDeclaredConstructors()) {
+                all.append(java.util.Arrays.toString(c.getParameterTypes())).append(" | ");
+                Class<?>[] p = c.getParameterTypes();
+                if (p.length == 2
+                        && p[0] == int.class
+                        && p[1] == long.class) {
+                    target = c;
+                }
+            }
+
+            log("掩盖上报: f 构造器列表 = " + all);
+
+            if (target == null) {
+                log("掩盖上报: 未找到 (int,long) 构造器");
+                return;
+            }
+
+            XposedBridge.hookMethod(
+                    target,
                     new XC_MethodHook() {
                         @Override
                         protected void beforeHookedMethod(
